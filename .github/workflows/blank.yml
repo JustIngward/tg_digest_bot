@@ -1,0 +1,21 @@
+name: Telegram Digest   # ← заголовок, который появится в Actions
+
+on:
+  schedule:
+    - cron:  '0 5 * * *'      # daily 08:00 MSK
+  workflow_dispatch:          # ручной запуск из UI
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      TG_TOKEN:       ${{ secrets.TG_TOKEN }}
+      CHAT_ID:        ${{ secrets.CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - run: python digest_to_tg.py
