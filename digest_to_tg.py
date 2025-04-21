@@ -163,4 +163,81 @@ FUNCTIONS = {"fetch_news": fetch_news}
 
 NEWS_RE = re.compile(r"^\s*[-*]\s+\*\*.+?\*\*.+\[(?P<text>.*?)\]\((?P<url>https?://[^)\s]+)\).+")
 
-# chat_digest, validate, send_tg, main — остаются прежними
+# ───── Function‑calling chat loop ─────
+
+def chat_digest() -> str:
+    msgs = [{"role": "user", "content": build_prompt()}]
+    while True:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=TEMPERATURE,
+            max_completion_tokens=1000,
+        )
+        choice = resp.choices[0]
+        if choice.finish_reason == "tool_call":
+            call = choice.message.tool_calls[0]
+            args = json.loads(call.function.arguments)
+            result = FUNCTIONS[call.function.name](**args)
+            msgs += [
+                choice.message,
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.function.name,
+                    "content": json.dumps(result, ensure_ascii=False),
+                },
+            ]
+            continue
+        return (choice.message.content or "").strip()
+
+# ───── Validation (only count now) ─────
+
+def validate(md: str) -> bool:
+    lines = [l for l in md.splitlines() if NEWS_RE.match(l)]
+    return len(lines) >= MIN_NEWS_LINES
+
+# ───── Telegram send (HTML safer) ─────
+
+def _escape_html(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_tg(text: str):
+    api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for chunk in (text[i:i + 3800] for i in range(0, len(text), 3800)):
+        html = _escape_html(chunk).replace("**", "<b>")
+        html = html.replace("__", "<i>")
+        # close tags crudely
+        html = html.replace("<b>", "</b>", 1) if html.count("<b>") % 2 else html
+        html = html.replace("<i>", "</i>", 1) if html.count("<i>") % 2 else html
+        resp = requests.post(api, json={
+            "chat_id": CHAT_ID,
+            "text": html,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }, timeout=20)
+        print("TG", resp.status_code, resp.text[:100])
+        resp.raise_for_status()
+
+# ───── Main ─────
+
+def main():
+    for attempt in range(1, MAX_RETRIES + 1):
+        md = chat_digest()
+        if validate(md):
+            for line in md.splitlines():
+                m = NEWS_RE.match(line)
+                if m:
+                    mark_sent(m.group("url"))
+            send_tg(md)
+            print("Digest sent ✔︎")
+            return
+        print(f"Attempt {attempt}: invalid digest, retry…")
+        time.sleep(3)
+    raise RuntimeError("Не удалось собрать валидный дайджест")
+
+if __name__ == "__main__":
+    main()
