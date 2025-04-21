@@ -24,7 +24,9 @@ MAX_RETRIES       = int(os.getenv("MAX_RETRIES", 3))
 SQLITE_PATH       = os.getenv("DB_PATH", "sent_news.db")
 TG_TOKEN          = os.environ["TG_TOKEN"]
 CHAT_ID           = os.environ["CHAT_ID"]
-NEWS_API_KEY      = os.environ["NEWS_API_KEY"]
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+if NEWS_API_KEY is None:
+    raise EnvironmentError("NEWS_API_KEY is not set — добавь ключ NewsAPI в Secrets / .env")
 
 WHITELIST = {
     "cnews.ru", "tadviser.ru", "vc.ru", "rbc.ru", "gazeta.ru",
