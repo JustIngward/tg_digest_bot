@@ -1,12 +1,21 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v14.1 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v15.0 (2025‑04‑22)
 
-📡  RSS‑only, приоритет 1С, без дубликатов кода‑ошибок
+🔍  RSS‑only + анализ тела статьи
+─────────────────────────────────
+1.  Скачиваем *все* записи из RSS‑лент за последние N дней.  
+2.  Отфильтровываем заголовком (ключевые слова).  
+3.  Если дайджест ещё не набран → подтягиваем HTML страницы и ищем ключ‑слова в теле.  
+4.  Приоритет 1С — минимум 2 пункта, если реально есть контент.  
+5.  Отправляем HTML‑дайджест в Telegram.
+
+Зависимости: `requests`, `feedparser`, `beautifulsoup4`, `python-dotenv`, `openai`.
 """
 from __future__ import annotations
 
-import os, json, datetime as dt, textwrap, requests, feedparser
+import os, re, json, datetime as dt, textwrap, requests, feedparser
 from urllib.parse import urlparse
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -19,51 +28,53 @@ assert TG_TOKEN and CHAT_ID and OPENAI_KEY, "TG_TOKEN, CHAT_ID, OPENAI_API_KEY r
 
 MODEL            = os.getenv("MODEL", "gpt-4o")
 TZ               = dt.timezone(dt.timedelta(hours=3))
-MAX_DAYS         = int(os.getenv("MAX_DAYS", 7))        # за сколько дней берём RSS
+MAX_DAYS         = int(os.getenv("MAX_DAYS", 7))
 DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 8))
 
 client = OpenAI()
 
-# ───── Ключевые слова / домены ─────
+# ───── Ключевые слова ─────
 ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
 ONEC_KEYS = {
-    "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "erp", "wms",
-    "зуп", "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия",
-    "odin es", "одинэс"
+    "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "wms", "зуп",
+    "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия", "odin es", "одинэс"
 }
 
 TECH_KEYWORDS = [
     "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
     "erp", "crm", "wms", "1с", "1c", "автоматиза", "интеграц", "миграц",
-    "обновлен", "devops", "разработ", "api", "микросервис", "kubernetes"
-]
+    "обновлен", "devops", "разработ", "api", "микросервис", "kubernetes",
+] + list(ONEC_KEYS)
 
 # ───── RSS‑ленты ─────
 RSS_FEEDS = [
-    # Tech / IT Russia
     "https://habr.com/ru/rss/all/all/?fl=ru",
     "https://vc.ru/rss",
     "https://www.rbc.ru/technology/rss/full/",
     "https://tadviser.ru/index.php/Статья:Новости?feed=rss",
     "https://novostiitkanala.ru/feed/",
     "https://www.kommersant.ru/RSS/section-tech.xml",
-    # Экосистема 1С
     "https://1c.ru/news/all.rss",
     "https://infostart.ru/rss/news/",
-    # Бизнес / аналитика
     "https://trends.rbc.ru/trends.rss",
     "https://rusbase.com/feed/",
 ]
 
-# ───── Парсинг RSS ─────
+# ───── Helpers ─────
+CUTOFF = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
+RE_TAG = re.compile(r"<[^>]+>")
 
-def _relevant(title: str) -> bool:
-    t = title.lower()
-    return any(k in t for k in TECH_KEYWORDS)
+
+def simple_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    return soup.get_text(separator=" ").lower()
+
+
+def has_kw(text: str) -> bool:
+    return any(k in text for k in TECH_KEYWORDS)
 
 
 def rss_fetch() -> list[dict]:
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
     arts: list[dict] = []
     for url in RSS_FEEDS:
         try:
@@ -71,49 +82,70 @@ def rss_fetch() -> list[dict]:
         except Exception:
             continue
         for e in feed.entries:
-            link = getattr(e, "link", "")
+            link  = getattr(e, "link", "")
             title = getattr(e, "title", "")
-            if not _relevant(title):
-                continue
             date_str = getattr(e, "published", "")[:10]
             try:
                 date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
             except Exception:
-                date_obj = cutoff
-            if date_obj < cutoff:
+                date_obj = CUTOFF
+            if date_obj < CUTOFF:
                 continue
             arts.append({"title": title, "url": link, "date": date_str})
+    # сортировка новее‑вверх
     return sorted(arts, key=lambda a: a["date"], reverse=True)
+
+# ───── Фильтрация 2‑этапа ─────
+
+def filter_stage(arts: list[dict]) -> list[dict]:
+    # 1. по заголовку
+    flagged = [a for a in arts if any(k in a["title"].lower() for k in TECH_KEYWORDS)]
+    if len(flagged) >= DIGEST_NEWS_CNT:
+        return flagged[:DIGEST_NEWS_CNT]
+
+    # 2. докидываем по содержимому
+    for a in arts:
+        if a in flagged:  # уже есть
+            continue
+        try:
+            html = requests.get(a["url"], timeout=10).text
+        except Exception:
+            continue
+        if has_kw(simple_text(html)):
+            flagged.append(a)
+        if len(flagged) >= DIGEST_NEWS_CNT:
+            break
+    return flagged
 
 # ───── Приоритет 1С ─────
 
-def is_onec(art: dict) -> bool:
-    t = art["title"].lower()
-    return any(k in t for k in ONEC_KEYS) or urlparse(art["url"]).netloc in ONEC_DOMAINS
+def is_onec(a: dict) -> bool:
+    t = a["title"].lower()
+    return any(k in t for k in ONEC_KEYS) or urlparse(a["url"]).netloc in ONEC_DOMAINS
 
 
 def select_articles(all_articles: list[dict]) -> list[dict]:
-    onec = [a for a in all_articles if is_onec(a)]
-    other = [a for a in all_articles if not is_onec(a)]
-    # минимум 2 новости 1С если есть
+    filtered = filter_stage(all_articles)
+    onec = [a for a in filtered if is_onec(a)]
+    other = [a for a in filtered if not is_onec(a)]
+    # минимум 2 1С‑новости, если есть
     selected = (onec[:2] if len(onec) >= 2 else onec) + other
     return selected[:DIGEST_NEWS_CNT]
 
-# ───── GPT‑Prompt ─────
+# ───── GPT‑Prompt & call ─────
 
 def build_prompt(arts: list[dict]) -> str:
     today = dt.datetime.now(TZ).strftime("%d %b %Y")
     return textwrap.dedent(f"""
         На входе JSON статей (title, url, date). Составь дайджест HTML‑Markdown:
-        • Три секции с пустой строкой:
+        • Три секции:
           🌍 <b>GLOBAL IT</b>\n🇷🇺 <b>RU TECH</b>\n🟡 <b>1С ЭКОСИСТЕМА</b>
-        • Формат: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
-        • Если статей меньше {DIGEST_NEWS_CNT} — выводи сколько есть.
+        • Формат строки: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
+        • Если статей меньше {DIGEST_NEWS_CNT}, выводи столько, сколько есть.
         • В конце блок "💡 <b>Insight</b>:" — 2 предложения.
         JSON: ```{json.dumps(arts, ensure_ascii=False)}```
     """).strip()
 
-# ───── GPT call ─────
 
 def build_digest(prompt: str) -> str:
     r = client.chat.completions.create(
