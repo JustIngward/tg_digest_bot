@@ -1,130 +1,118 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v4.5 (2025‑04‑21)
+"""IT‑Digest Telegram bot — v5.0 (2025‑04‑21)
 
-Bug‑fix v4.5 — дайджест не собирался, потому что regex требовал **жирный**
-------------------------------------------------------------------------
-Изменения:
-1. **NEWS_LINE_RE**
-   • `**` после маркера теперь *опционален*;
-   • дата допускает год `(DD.MM)` *или* `(DD.MM.YYYY)`.
-2. **URL HEAD‑probe** — быстрый `requests.head` перед финальной фильтрацией
-   (домен + статус <400).
-3. `count_news()` и `post_filter()` используют единый `NEWS_LINE_RE`.
-4. MAX_ITER оставлен 6, остальная логика не тронута.
+🔥 Полная перезагрузка логики — без «редактора»
+──────────────────────────────────────────────
+Цель: собирать свежие статьи только из проверенных источников, без выдуманных
+новостей, с минимальным числом вызовов API.
+
+Основная схема v5.0
+───────────────────
+1. **Collector** (одна модель, web_search) → черновик.
+2. **Python‑валидатор**:
+   • дата ≤ `MAX_AGE_HOURS`;
+   • домен ∈ `ALLOWED_DOMAINS`;
+   • HEAD <400;
+   • формат строки.
+3. Если годных строк < `MIN_NEWS`, делаем новую попытку (до `MAX_ITER`).
+4. Готовый дайджест сразу шлём в Telegram.
 """
-import os, re, sqlite3, datetime as dt, requests
-from hashlib import md5
+import os, re, sqlite3, datetime as dt, requests, time
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# ─────────────── CONFIG ───────────────
 load_dotenv()
-TZ = dt.timezone(dt.timedelta(hours=3))
-COLLECTOR_MODEL = os.getenv("COLLECTOR_MODEL", "o3")
-CRITIC_MODEL    = os.getenv("CRITIC_MODEL", COLLECTOR_MODEL)
+TZ              = dt.timezone(dt.timedelta(hours=3))
+MODEL           = os.getenv("MODEL", "o3")
 MAX_AGE_HOURS   = int(os.getenv("MAX_AGE_HOURS", 168))
 MIN_NEWS        = int(os.getenv("MIN_NEWS", 6))
 MIN_NEWS_SOFT   = int(os.getenv("MIN_NEWS_SOFT", 3))
 MAX_ITER        = int(os.getenv("MAX_ITER", 6))
 TG_TOKEN        = os.environ["TG_TOKEN"]
 CHAT_ID         = os.environ["CHAT_ID"]
-ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS", "").split(",") if d.strip()]
-
-# ────────────────────────────────────────── REGEX ──╮
-NEWS_LINE_RE = re.compile(
-    r"^\s*[-*]\s*(?:\*\*)?.+?\]\(https?://[^)\s]+\)\s*\((\d{1,2})\.(\d{1,2})(?:\.\d{4})?\)",
-    re.IGNORECASE)
-URL_M_RE = re.compile(r"\((https?://[^)\s]+)\)")
+ALLOWED_DOMAINS = [d.strip().lower() for d in os.getenv("ALLOWED_DOMAINS","").split(',') if d.strip()]
 
 client = OpenAI()
 
-# ────────────────────────────────────────── HELPERS ─╯
+NEWS_RE = re.compile(r"^\s*[-*]\s*(?:\*\*)?.+?\]\((https?://[^)\s]+)\)\s*\((\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?\)")
+
+# ─────────────── HELPERS ───────────────
 
 def allowed_domain(url: str) -> bool:
     host = (urlparse(url).hostname or "").lower()
-    return any(host == d or host.endswith("." + d) for d in ALLOWED_DOMAINS) if ALLOWED_DOMAINS else True
+    return any(host == d or host.endswith('.'+d) for d in ALLOWED_DOMAINS) if ALLOWED_DOMAINS else True
 
-def link_alive(url: str) -> bool:
+def fresh_date(day:int, mon:int, year:int|None)->bool:
+    y = year or dt.datetime.now(TZ).year
+    pub = dt.datetime(y,mon,day,tzinfo=TZ)
+    return (dt.datetime.now(TZ)-pub).total_seconds() <= MAX_AGE_HOURS*3600
+
+def head_ok(url:str)->bool:
     try:
-        return requests.head(url, allow_redirects=True, timeout=5).status_code < 400
+        return requests.head(url,allow_redirects=True,timeout=5).status_code<400
     except requests.RequestException:
         return False
 
-def count_news(text: str) -> int:
-    return sum(1 for ln in text.splitlines() if NEWS_LINE_RE.match(ln))
+# ─────────────── COLLECTOR ───────────────
 
-def domains_md() -> str:
-    return ", ".join(ALLOWED_DOMAINS) if ALLOWED_DOMAINS else "любой авторитетный сайт"
+def prompt(today:str)->str:
+    days=MAX_AGE_HOURS//24
+    whitelist=", ".join(ALLOWED_DOMAINS) if ALLOWED_DOMAINS else "любых проверенных"
+    return (
+        f"Сегодня {today}. Сформируй черновик еженедельного IT‑дайджеста (Markdown).\n"
+        f"Бери ТОЛЬКО новости из доменов: {whitelist}. Каждая новость моложе {days} дней.\n"
+        "Формат одной строки: `- **Заголовок** — кратко. [Источник](URL) (DD.MM или DD.MM.YYYY)`. ≤30 слов.\n"
+        "Секции: 🌍 ГЛОБАЛЬНЫЙ IT, 🇷🇺 РОССИЙСКИЙ TECH, 🟡 ЭКОСИСТЕМА 1С.\n"
+        f"Минимум {MIN_NEWS} строк суммарно. Заверши блоком Insight."
+    )
 
-# ────────────────────────────────────────── PROMPTS ─╮
-days = MAX_AGE_HOURS // 24
-PROMPT_TEMPLATE = (
-    "Ты — IT‑аналитик. Сформируй **черновик** еженедельного IT‑дайджеста (Markdown).\n"
-    f"• Бери ТОЛЬКО материалы с доменов: {domains_md()}.\n"
-    f"• Источник моложе {days} дней.\n"
-    "• Каждая новость: `- **Заголовок** — текст. [Источник](URL) (DD.MM или DD.MM.YYYY)`. ≤30 слов.\n"
-    "• Секции: 🌍 ГЛОБАЛЬНЫЙ IT, 🇷🇺 РОССИЙСКИЙ TECH, 🟡 ЭКОСИСТЕМА 1С.\n"
-    f"• Минимум {MIN_NEWS} новостей. Insight в конце."
-)
-CRITIC_SYSTEM = (
-    "Проверь: ссылка+дата обязательны; домен в whitelist; дата ≤ {days} дней; HEAD 4xx/5xx убрать. Если < {mn} строк → `RETRY`."
-).format(days=days, mn=MIN_NEWS)
 
-# ────────────────────────────────────────── CORE ─╯
+def collect_once()->str:
+    today=dt.datetime.now(TZ).strftime('%d %b %Y')
+    resp=client.responses.create(model=MODEL,tools=[{"type":"web_search"}],input=[{"role":"user","content":prompt(today)}],temperature=1,store=False)
+    return resp.output_text
 
-def call_collector():
-    today = dt.datetime.now(TZ).strftime("%d %b %Y")
-    return client.responses.create(
-        model=COLLECTOR_MODEL,
-        tools=[{"type":"web_search"}],
-        input=[{"role":"user","content":PROMPT_TEMPLATE.format(today=today)}],
-        temperature=1,
-        store=False,
-    ).output_text.strip()
+# ─────────────── VALIDATOR ───────────────
 
-def critic_pass(draft: str):
-    return client.chat.completions.create(
-        model=CRITIC_MODEL,
-        temperature=1,
-        messages=[{"role":"system","content":CRITIC_SYSTEM},{"role":"user","content":draft}],
-    ).choices[0].message.content.strip()
-
-def post_filter(text: str) -> str:
-    keep=[]
-    for ln in text.splitlines():
-        if not NEWS_LINE_RE.match(ln):
+def validate(raw:str):
+    good=[]
+    for ln in raw.splitlines():
+        m=NEWS_RE.match(ln)
+        if not m:
             continue
-        url_m = URL_M_RE.search(ln)
-        if not url_m:
+        url,day,mon,year=m.group(1),int(m.group(2)),int(m.group(3)), m.group(4)
+        year=int(year) if year else None
+        if not (allowed_domain(url) and fresh_date(day,mon,year) and head_ok(url)):
             continue
-        url = url_m.group(1)
-        if allowed_domain(url) and link_alive(url):
-            keep.append(ln)
-    print(f"after filter: {len(keep)} lines")
-    return "\n".join(keep)
+        good.append(ln.strip())
+    return good
+
+# ─────────────── PIPELINE ───────────────
 
 def produce_digest():
-    for attempt in range(MAX_ITER):
-        draft   = call_collector()
-        cleaned = critic_pass(draft)
-        if cleaned == "RETRY":
-            continue
-        filtered = post_filter(cleaned)
-        n = count_news(filtered)
-        if n >= MIN_NEWS or (attempt == MAX_ITER-1 and n >= MIN_NEWS_SOFT):
-            return filtered
-    raise RuntimeError("не удалось собрать дайджест — мало строк с валидной ссылкой")
+    for i in range(1,MAX_ITER+1):
+        draft=collect_once()
+        lines=validate(draft)
+        print(f"iter {i}: {len(lines)} valid lines")
+        if len(lines)>=MIN_NEWS or (i==MAX_ITER and len(lines)>=MIN_NEWS_SOFT):
+            return "\n".join(lines)
+        time.sleep(2)  # маленькая пауза между попытками
+    raise RuntimeError("Не удалось собрать дайджест: мало статей")
 
-# ────────────────────────────────────────── SEND ─╯
+# ─────────────── SEND ───────────────
 
-def send(text: str):
+def send(msg:str):
     url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for i in range(0,len(text),3900):
-        r=requests.post(url,json={"chat_id":CHAT_ID,"text":text[i:i+3900],"parse_mode":"Markdown","disable_web_page_preview":False})
+    for i in range(0,len(msg),3900):
+        r=requests.post(url,json={"chat_id":CHAT_ID,"text":msg[i:i+3900],"parse_mode":"Markdown","disable_web_page_preview":False})
         if r.status_code!=200:
             raise RuntimeError(r.text)
 
-# ────────────────────────────────────────── MAIN ─╯
-if __name__=="__main__":
-    sqlite3.connect("sent_hashes.db").execute("CREATE TABLE IF NOT EXISTS sent(hash TEXT PRIMARY KEY)")
-    send(produce_digest())
+# ─────────────── MAIN ───────────────
+if __name__=='__main__':
+    sqlite3.connect('sent_hashes.db').execute('CREATE TABLE IF NOT EXISTS sent(hash TEXT PRIMARY KEY)')
+    digest=produce_digest()
+    if digest:
+        send(digest)
