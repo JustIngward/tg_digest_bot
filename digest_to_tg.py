@@ -34,9 +34,23 @@ client = OpenAI()
 
 # домены и ключевые слова для приоритета 1С
 ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
-ONEC_KEYS    = {"1с", "1c", "1‑с", "1-с"}
+ONEC_KEYS    = {
+    "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "erp", "wms",
+    "зуп", "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия",
+    "odin es", "одинэс"
+}
 
-RSS_FEEDS = [
+# ключевые слова, чтобы отсеять офтоп (финансы, lifestyle и пр.)
+TECH_KEYWORDS = [
+    "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
+    "erp", "crm", "wms", "1с", "1c", "автоматиза", "интеграц", "миграц",
+    "обновлен", "devops", "разработ", "api", "микросервис", "kubernetes"
+] = [
+    "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
+    "erp", "crm", "1с", "1c", "автоматиза",
+]
+
+RSS_FEEDS = [ = [
     # Tech / IT Russia
     "https://habr.com/ru/rss/all/all/?fl=ru",
     "https://vc.ru/rss",
@@ -54,26 +68,32 @@ RSS_FEEDS = [
 
 # ───── COLLECT RSS ─────
 
+def _relevant(title: str) -> bool:
+    t = title.lower()
+    return any(k in t for k in TECH_KEYWORDS)
+
 def rss_fetch() -> list[dict]:
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
-    articles = []
+    arts = []
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
         except Exception:
             continue
         for e in feed.entries:
-            link = getattr(e, "link", "")
+            link  = getattr(e, "link", "")
             title = getattr(e, "title", "")
+            if not _relevant(title):
+                continue  # фильтруем офтоп
             date_str = getattr(e, "published", "")[:10]
             try:
                 date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
             except Exception:
-                date_obj = cutoff  # fallback
+                date_obj = cutoff
             if date_obj < cutoff:
                 continue
-            articles.append({"title": title, "url": link, "date": date_str})
-    return sorted(articles, key=lambda a: a["date"], reverse=True)
+            arts.append({"title": title, "url": link, "date": date_str})
+    return sorted(arts, key=lambda a: a["date"], reverse=True)(articles, key=lambda a: a["date"], reverse=True)
 
 # ───── PRIORITIZE 1C ─────
 
@@ -89,8 +109,9 @@ def is_onec(a: dict) -> bool:
 def select_articles(all_articles: list[dict]) -> list[dict]:
     onec = [a for a in all_articles if is_onec(a)]
     other = [a for a in all_articles if not is_onec(a)]
-    selected = onec + other
-    return selected[:DIGEST_NEWS_CNT]
+    # требуем хотя бы 2 новости 1С, если есть
+    selected = (onec[:2] if len(onec) >= 2 else onec) + other
+    return selected[:DIGEST_NEWS_CNT][:DIGEST_NEWS_CNT]
 
 # ───── GPT PROMPT ─────
 
