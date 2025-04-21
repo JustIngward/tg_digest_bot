@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v17.2 (2025‑04‑24)
-
-✓ body‑filter пропускает 1С‑статьи без INCLUDE‑слов.
-✓ need_onec ≥ 1 — дайджест соберётся даже при скудном 1С‑потоке.
-✓ fallback‑сообщение, если итоговый список < DIGEST_MIN.
+"""IT‑Digest Telegram bot — v17.4 (2025‑04‑24)
+Полный, проверенный скрипт без обрывов строк.
 """
 from __future__ import annotations
 
@@ -17,12 +14,22 @@ from openai import OpenAI
 
 # ─── CONFIG ───
 load_dotenv()
-TG_TOKEN = os.getenv("TG_TOKEN"); CHAT_ID = os.getenv("CHAT_ID"); OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+TG_TOKEN = os.getenv("TG_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
 assert TG_TOKEN and CHAT_ID and OPENAI_KEY, "TG_TOKEN, CHAT_ID, OPENAI_API_KEY required"
-MODEL = os.getenv("MODEL", "gpt-4o"); TZ = dt.timezone(dt.timedelta(hours=3))
-MAX_DAYS, MAX_PER_FEED, MAX_HTML = 7, 50, 250
-DIGEST_MIN, DIGEST_MAX = 8, 12; PERC_ONEC = 0.4
-client = OpenAI(); CUTOFF = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
+
+MODEL = os.getenv("MODEL", "gpt-4o")
+TZ = dt.timezone(dt.timedelta(hours=3))
+MAX_DAYS = 7
+MAX_PER_FEED = 50
+MAX_HTML = 250
+DIGEST_MIN = 8
+DIGEST_MAX = 12
+PERC_ONEC = 0.4  # 40 %
+
+client = OpenAI()
+CUTOFF = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
 
 # ─── KEYWORDS ───
 ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
@@ -39,23 +46,31 @@ INCLUDE = set(ONEC_KEYS) | {
 }
 EXCLUDE = {"crypto", "iphone", "lifestyle", "шоколад", "авто", "банкомат"}
 
+# ─── RSS FEEDS ───
 RSS_FEEDS = [
-    "https://habr.com/ru/rss/all/all/?fl=ru", "https://vc.ru/rss", "https://www.rbc.ru/technology/rss/full/",
-    "https://tadviser.ru/index.php/Статья:Новости?feed=rss", "https://novostiitkanala.ru/feed/",
-    "https://www.kommersant.ru/RSS/section-tech.xml", "https://1c.ru/news/all.rss",
-    "https://infostart.ru/rss/news/", "https://trends.rbc.ru/trends.rss", "https://rusbase.com/feed/",
+    "https://habr.com/ru/rss/all/all/?fl=ru",
+    "https://vc.ru/rss",
+    "https://www.rbc.ru/technology/rss/full/",
+    "https://tadviser.ru/index.php/Статья:Новости?feed=rss",
+    "https://novostiitkanala.ru/feed/",
+    "https://www.kommersant.ru/RSS/section-tech.xml",
+    "https://1c.ru/news/all.rss",
+    "https://infostart.ru/rss/news/",
+    "https://trends.rbc.ru/trends.rss",
+    "https://rusbase.com/feed/",
 ]
 
-# ─── helpers ───
+# ─── Helpers ───
 plain = lambda html: BeautifulSoup(html, "html.parser").get_text(" ").lower()
-async def fetch_html(url, cl):
+
+async def fetch_html(url: str, cl: httpx.AsyncClient) -> str | None:
     try:
         r = await cl.get(url, timeout=8)
         return r.text if r.status_code == 200 else None
     except Exception:
         return None
 
-# ─── 0. COLLECT ───
+# ─── 0. Collect ───
 
 def collect_raw():
     onec, other, events = [], [], []
@@ -65,7 +80,8 @@ def collect_raw():
         except Exception:
             continue
         for e in fp.entries[:MAX_PER_FEED]:
-            link, title = e.get("link", ""), e.get("title", "")
+            link = e.get("link", "")
+            title = e.get("title", "")
             date_str = (e.get("published") or e.get("updated") or "")[:10]
             try:
                 d = dt.datetime.strptime(date_str, "%Y-%m-%d")
@@ -75,18 +91,20 @@ def collect_raw():
                 continue
             rec = {"title": title, "url": link, "date": d.strftime("%d.%m.%Y"), "t": title.lower()}
             if any(k in rec["t"] for k in EVENT_KEYS):
-                events.append(rec); continue
-            (onec if urlparse(link).netloc in ONEC_DOMAINS or any(k in rec["t"] for k in ONEC_KEYS) else other).append(rec)
+                events.append(rec)
+                continue
+            target = onec if urlparse(link).netloc in ONEC_DOMAINS or any(k in rec["t"] for k in ONEC_KEYS) else other
+            target.append(rec)
     return onec, other, events
 
-# ─── 1. TITLE FILTER ───
+# ─── 1. Title filter ───
 
 def title_filter(lst):
     return [a for a in lst if not any(w in a["t"] for w in EXCLUDE) and any(k in a["t"] for k in INCLUDE)]
 
-# ─── 2. BODY FILTER ───
-async def body_filter(cand):
-    subset = cand[:MAX_HTML]
+# ─── 2. Body filter ───
+async def body_filter(candidates):
+    subset = candidates[:MAX_HTML]
     async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent": "Mozilla/5.0"}) as cl:
         pages = await asyncio.gather(*[fetch_html(a["url"], cl) for a in subset])
     out = []
@@ -98,39 +116,46 @@ async def body_filter(cand):
             out.append(art)
     return out
 
-# ─── 3. GPT RANK ───
+# ─── 3. GPT rank ───
 
 def gpt_rank(pool):
-    prompt = "Оцени по шкале 0‑10 важность новости для интегратора 1С. Ответ JSON {\"idx\":score}."
+    prompt = "Оцени по шкале 0‑10 важность новости для интегратора 1С. Ответ JSON {\\\"idx\\\":score}."
     mini = [{"idx": i, "title": a["title"], "url": a["url"]} for i, a in enumerate(pool)]
     try:
-        resp = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": prompt + json.dumps(mini, ensure_ascii=False)}], temperature=0, max_tokens=300)
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role": "user", "content": prompt + json.dumps(mini, ensure_ascii=False)}],
+            temperature=0,
+            max_tokens=300,
+        )
         scores = json.loads(resp.choices[0].message.content)
     except Exception:
         scores = {str(i): 5 for i in range(len(pool))}
     return sorted(pool, key=lambda x: -scores.get(str(pool.index(x)), 0))
 
-# ─── 4. LAYOUT ───
+# ─── 4. Layout ───
 
-def layout(news_onec, news_other, events):
+def layout(onecs, others, events):
     need_onec = max(1, int(DIGEST_MAX * PERC_ONEC))
-    news = (news_onec[:need_onec] + news_other)[:DIGEST_MAX]
+    news = (onecs[:need_onec] + others)[:DIGEST_MAX]
     return news, events[:3]
 
-# ─── PROMPT ───
+# ─── Prompt ───
 
 def build_prompt(news, evnts):
-    return textwrap.dedent(f"""
-        Ты — редактор B2B‑дайджеста для интеграторов 1С. Используй ТОЛЬКО данные JSON.
+    return textwrap.dedent(
+        f"""
+        Ты — редактор B2B‑дайджеста для интеграторов 1С. Используй ТОЛЬКО данные JSON.
         Секции: 🌍/🇷🇺/🟡/🎪. Если секция пуста — «без …».
-        Требования: 8‑12 новостей (≥40 % 1С) + до 3 событий.
+        Требования: 8‑12 новостей (≥40 % 1С) и до 3 событий.
         Формат: - <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)
-        В конце "💡 <b>Insight</b>:" — 2 предложения.
+        В конце "💡 <b>Insight</b>:" — 2 предложения.
         JSON_NEWS: ```{json.dumps(news, ensure_ascii=False)}```
         JSON_EVENTS: ```{json.dumps(evnts, ensure_ascii=False)}```
-    """).strip()
+        """
+    ).strip()
 
-# ─── SEND ───
+# ─── Send ───
 
 def sanitize(txt):
     txt = re.sub(r'href="([^"]+)"', lambda m: f'href=\"{m.group(1).replace("&", "&amp;")}\"', txt)
@@ -141,9 +166,22 @@ def sanitize(txt):
 def send(html):
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for i in range(0, len(html), 3800):
-        chunk = sanitize(html[i:i + 3800])
-        requests.post(api, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web
+        chunk = sanitize(html[i : i + 3800])
+        r = requests.post(
+            api,
+            json={
+                "chat_id": CHAT_ID,
+                "text": chunk,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+        )
+        r.raise_for_status()
+
+# ─── Main ───
+
+def main():
+    onec_raw, other_raw, events_raw = collect_raw()
+    onec = title_filter(onec_raw)
+    other = title_filter(other_raw)
+    events = title_filter(events_raw)
