@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v9.1 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v10.0 (2025‑04‑22)
 
-► Переход на **Assistants API + GPT‑4o + встроенный browser** — ChatCompletion
-  пока не поддерживает `web_search`, поэтому мигрируем на ассистента.
-► Логика та же: модель готовит Markdown‑дайджест, мы проверяем, отправляем.
+◼️ Откат от недоступного встроенного browser.
+◼️ Реализуем **свой** инструмент `fetch_news` (NewsAPI) через function‑calling.
+◼️ GPT‑4o вызывает функцию, Python тянет статьи, модель пишет краткие выжимки.
 """
 
 from __future__ import annotations
 
-import os
-import re
-import sqlite3
-import time
-import datetime as dt
+import os, re, sqlite3, time, datetime as dt, requests, textwrap, json
 from urllib.parse import urlparse
-
-import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -30,6 +24,7 @@ MAX_RETRIES       = int(os.getenv("MAX_RETRIES", 3))
 SQLITE_PATH       = os.getenv("DB_PATH", "sent_news.db")
 TG_TOKEN          = os.environ["TG_TOKEN"]
 CHAT_ID           = os.environ["CHAT_ID"]
+NEWS_API_KEY      = os.environ["NEWS_API_KEY"]
 
 WHITELIST = {
     "cnews.ru", "tadviser.ru", "vc.ru", "rbc.ru", "gazeta.ru",
@@ -45,93 +40,121 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS sent (
     ts DATETIME DEFAULT CURRENT_TIMESTAMP
 );"""
 
-def db_conn() -> sqlite3.Connection:
+def db_conn():
     conn = sqlite3.connect(SQLITE_PATH)
     conn.execute(SCHEMA)
     return conn
 
-def url_fp(url: str) -> str:
+def fp(url:str):
     return str(hash(url))
 
-def already_sent(url: str) -> bool:
+def already_sent(url:str):
     with db_conn() as c:
-        return c.execute("SELECT 1 FROM sent WHERE fp=?", (url_fp(url),)).fetchone() is not None
+        return c.execute("SELECT 1 FROM sent WHERE fp=?", (fp(url),)).fetchone() is not None
 
-def mark_sent(url: str):
+def mark_sent(url:str):
     with db_conn() as c:
-        c.execute("INSERT OR IGNORE INTO sent(fp) VALUES (?)", (url_fp(url),))
+        c.execute("INSERT OR IGNORE INTO sent(fp) VALUES (?)", (fp(url),))
+
+# ───── Tool: fetch_news ─────
+
+def fetch_news(topic:str, n:int=5):
+    """Get n fresh articles for topic from NewsAPI restricted to WHITELIST."""
+    url="https://newsapi.org/v2/everything"
+    from_date=(dt.datetime.utcnow()-dt.timedelta(days=MAX_AGE_DAYS)).isoformat("T","seconds")
+    params={
+        "q":topic,
+        "from":from_date,
+        "language":"ru",
+        "domains":",".join(WHITELIST),
+        "pageSize":n,
+        "sortBy":"publishedAt",
+        "apiKey":NEWS_API_KEY,
+    }
+    data=requests.get(url,params=params,timeout=10).json()
+    res=[]
+    for art in data.get("articles",[]):
+        res.append({
+            "title":art["title"],
+            "url":art["url"],
+            "published":art["publishedAt"][:10],
+            "source":art["source"]["name"],
+            "description":art.get("description",""),
+        })
+    return res[:n]
 
 # ───── PROMPT ─────
 
-def build_prompt() -> str:
-    today = dt.datetime.now(TZ).strftime("%d %b %Y")
-    return f"""
-Ты — русский IT‑аналитик. Собери дайджест в Markdown.
-• Статьи только с доменов white‑list и возрастом ≤ {MAX_AGE_DAYS} дней.
-• Формат: "- **Заголовок** — 1–2 предложения. [Источник](URL) (DD.MM.YYYY)".
-• Три секции в порядке: 🌍 **ГЛОБАЛЬНЫЙ IT**; 🇷🇺 **РОССИЙСКИЙ TECH**; 🟡 **ЭКОСИСТЕМА 1С**.
-• Минимум {MIN_NEWS_LINES} новостей суммарно.
-• Заверши блоком "💡 **Insight:**" — 2–3 предложения выводов.
-• Заголовок всего: "🗞️ **IT‑Digest • {today}**".
-• Без UTM‑меток и лишних эмодзи.
-""".strip()
+def build_prompt():
+    today=dt.datetime.now(TZ).strftime("%d %b %Y")
+    return textwrap.dedent(f"""
+        Ты — русский IT‑аналитик. Используй функцию fetch_news для поиска статей.
+        Сделай дайджест в Markdown, следуя правилам:
+        • Формат новости: "- **Заголовок** — 1–2 предложения. [Источник](URL) (DD.MM.YYYY)".
+        • Три секции: 🌍 **ГЛОБАЛЬНЫЙ IT**, 🇷🇺 **РОССИЙСКИЙ TECH**, 🟡 **ЭКОСИСТЕМА 1С**.
+        • Минимум {MIN_NEWS_LINES} новостей суммарно.
+        • В конце блок "💡 **Insight:**".
+        • Заголовок: "🗞️ **IT‑Digest • {today}**".
+        • Без UTM‑меток и лишних эмодзи.
+    """).strip()
 
-# ───── ASSISTANT SETUP (cached) ─────
+TOOLS=[{
+    "type":"function",
+    "function":{
+        "name":"fetch_news",
+        "description":"Возвращает список свежих статей по теме",
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "topic":{"type":"string"},
+                "n":{"type":"integer","default":5},
+            },
+            "required":["topic"]
+        }
+    }
+}]
 
-def get_assistant_id() -> str:
-    cache = ".assistant_id"
-    if os.path.exists(cache):
-        return open(cache).read().strip()
-    assistant = client.beta.assistants.create(
-        name="IT Digest Bot",
-        model=MODEL,
-        tools=[{"type": "browser"}],
-        temperature=TEMPERATURE,
-    )
-    with open(cache, "w") as f:
-        f.write(assistant.id)
-    return assistant.id
+# ───── TOOL DISPATCH ─────
+FUNCTIONS={"fetch_news":fetch_news}
 
-ASSISTANT_ID = get_assistant_id()
+NEWS_RE=re.compile(r"^\s*[-*]\s+\*\*.+?\*\*.+\[(?P<text>.*?)\]\((?P<url>https?://[^)\s]+)\)\s*\(\d{2}\.\d{2}\.\d{4}?\)")
 
-# ───── GENERATE DIGEST VIA THREAD/RUN ─────
-NEWS_RE = re.compile(r"^\s*[-*]\s+\*\*.+?\*\*.+\[.*?](https?://[^)\s]+)\s*\(\d{2}\.\d{2}\.\d{4}?\)")
-
-
-def assistant_digest() -> str:
-    thread = client.beta.threads.create()
-    client.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=build_prompt(),
-    )
-    run = client.beta.threads.runs.create(
-        thread_id=thread.id,
-        assistant_id=ASSISTANT_ID,
-    )
-    # polling until completed (simplest)
-    while run.status in {"queued", "in_progress"}:
-        time.sleep(5)
-        run = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
-    if run.status != "completed":
-        raise RuntimeError(f"Assistant run failed: {run.status}")
-    msgs = client.beta.threads.messages.list(thread_id=thread.id)
-    return msgs.data[0].content[0].text.value.strip()
+def chat_digest():
+    msgs=[{"role":"user","content":build_prompt()}]
+    while True:
+        resp=client.chat.completions.create(
+            model=MODEL,
+            messages=msgs,
+            tools=TOOLS,
+            tool_choice="auto",
+            temperature=TEMPERATURE,
+            max_completion_tokens=900,
+        )
+        choice=resp.choices[0]
+        if choice.finish_reason=="tool_call":
+            call=choice.message.tool_calls[0]
+            name=call.function.name
+            args=json.loads(call.function.arguments)
+            result=FUNCTIONS[name](**args)
+            msgs.append(choice.message)
+            msgs.append({"role":"tool","tool_call_id":call.id,"name":name,"content":json.dumps(result,ensure_ascii=False)})
+            continue
+        return choice.message.content.strip()
 
 # ───── VALIDATE ─────
 
-def extract_urls(md: str):
+def extract_urls(md:str):
     for line in md.splitlines():
-        m = NEWS_RE.match(line)
+        m=NEWS_RE.match(line)
         if m:
-            yield m.group(1)
+            yield m.group("url")
 
-def validate(md: str) -> bool:
-    lines = [l for l in md.splitlines() if NEWS_RE.match(l)]
-    if len(lines) < MIN_NEWS_LINES:
+def validate(md:str):
+    lines=[l for l in md.splitlines() if NEWS_RE.match(l)]
+    if len(lines)<MIN_NEWS_LINES:
         return False
     for url in extract_urls(md):
-        host = urlparse(url).netloc
+        host=urlparse(url).netloc
         if not any(host.endswith(d) for d in WHITELIST):
             return False
         if already_sent(url):
@@ -140,29 +163,25 @@ def validate(md: str) -> bool:
 
 # ───── TELEGRAM ─────
 
-def send_tg(text: str):
-    api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for chunk in (text[i:i+3900] for i in range(0, len(text), 3900)):
-        requests.post(api, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "Markdown",
-            "disable_web_page_preview": False,
-        }, timeout=20).raise_for_status()
+def send_tg(text:str):
+    api=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for chunk in (text[i:i+3900] for i in range(0,len(text),3900)):
+        requests.post(api,json={"chat_id":CHAT_ID,"text":chunk,"parse_mode":"Markdown","disable_web_page_preview":False},timeout=20).raise_for_status()
 
 # ───── MAIN ─────
 
 def main():
-    for attempt in range(1, MAX_RETRIES + 1):
-        md = assistant_digest()
+    for attempt in range(1,MAX_RETRIES+1):
+        md=chat_digest()
         if validate(md):
             for url in extract_urls(md):
                 mark_sent(url)
             send_tg(md)
             print("Digest sent ✔︎")
             return
-        print(f"Attempt {attempt}: digest invalid, retry…")
+        print(f"Attempt {attempt}: invalid digest, retry …")
+        time.sleep(3)
     raise RuntimeError("Не удалось собрать валидный дайджест")
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
