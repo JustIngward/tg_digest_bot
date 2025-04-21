@@ -18,6 +18,7 @@ def build(period: str) -> str:
     openai.api_key = os.getenv("OPENAI_API_KEY")
     resp = openai.chat.completions.create(
         model=MODEL,
+        tools = [{"type": "web_search"}], # --- новая строка, по легенде должна дать доступ модели в интернет. 
         messages=[{"role":"user", "content": prompt(period)}],
         temperature=1, # было 0.4. Новая версия поддерживает только 1
         max_completion_tokens=2048,  #было max_tokens
