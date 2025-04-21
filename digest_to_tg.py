@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v15.1 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v15.2 (2025‑04‑22)
 
-RSS‑only + анализ тела, приоритет 1С, HTML‑safe отправка
+• RSS‑only
+• Двухэтапный фильтр (title + HTML)
+• Приоритет 1С (≥ 2 пункта, если доступны)
+• HTML‑safe отправка в Telegram
 """
 from __future__ import annotations
 
@@ -39,8 +42,6 @@ TECH_EXCLUDE = [
     "iphone", "crypto", "биткоин", "ethereum", "самолет", "авто", "электромобил",
     "шоколад", "фисташк", "биржа", "lifestyle", "здоровье", "банкомат",
 ]
-# include + extra keys
-TECH_KEYWORDS = TECH_INCLUDE + list(ONEC_KEYS) + list(ONEC_KEYS)
 
 # ───── RSS LIST ─────
 RSS_FEEDS = [
@@ -66,7 +67,8 @@ def _plain(html: str) -> str:
 def _hit(text: str) -> bool:
     if any(w in text for w in TECH_EXCLUDE):
         return False
-    return any(k in text for k in TECH_INCLUDE) or any(k in text for k in ONEC_KEYS)k in text for k in TECH_KEYWORDS)
+    return any(k in text for k in TECH_INCLUDE) or any(k in text for k in ONEC_KEYS)
+
 
 def rss_fetch() -> list[dict]:
     out = []
@@ -81,11 +83,17 @@ def rss_fetch() -> list[dict]:
             try:
                 date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
             except Exception:
-                date_obj = dt.datetime.utcnow()  # дата не распарсилась – считаем свежей
-            title_lower = title.lower()
-            if date_obj >= CUTOFF:
-                out.append({"title": title, "url": link, "date": date_obj.strftime("%d.%m.%Y"), "_t": title_lower})({"title": title, "url": link, "date": date_str})
+                date_obj = dt.datetime.utcnow()  # считай свежей
+            if date_obj < CUTOFF:
+                continue
+            out.append({
+                "title": title,
+                "url": link,
+                "date": date_obj.strftime("%d.%m.%Y"),
+                "_t": title.lower(),
+            })
     return sorted(out, key=lambda a: a["date"], reverse=True)
+
 
 def filter_stage(arts: list[dict]) -> list[dict]:
     first = [a for a in arts if _hit(a["_t"])]
@@ -104,9 +112,11 @@ def filter_stage(arts: list[dict]) -> list[dict]:
             break
     return first
 
+
 def is_onec(a: dict) -> bool:
     return (any(k in a["title"].lower() for k in ONEC_KEYS) or
             urlparse(a["url"]).netloc in ONEC_DOMAINS)
+
 
 def select_articles(all_arts: list[dict]) -> list[dict]:
     arts = filter_stage(all_arts)
@@ -115,18 +125,19 @@ def select_articles(all_arts: list[dict]) -> list[dict]:
     sel = (onec[:2] if len(onec) >= 2 else onec) + other
     return sel[:DIGEST_NEWS_CNT]
 
-# ───── GPT PROMPT ─────
+# ───── GPT ─────
 
 def build_prompt(arts: list[dict]) -> str:
     today = dt.datetime.now(TZ).strftime("%d %b %Y")
     return textwrap.dedent(f"""
-        На входе JSON статей (title, url, date). Составь дайджест HTML‑Markdown с тремя секциями:
+        На входе JSON статей (title, url, date). Составь дайджест HTML‑Markdown c тремя секциями:
         🌍 <b>GLOBAL IT</b>\n🇷🇺 <b>RU TECH</b>\n🟡 <b>1С ЭКОСИСТЕМА</b>
         Формат: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
-        Если статей меньше {DIGEST_NEWS_CNT} — выводи сколько есть.
+        Если статей меньше {DIGEST_NEWS_CNT}, выводи столько, сколько есть.
         В конце блок "💡 <b>Insight</b>:" — 2 предложения.
         JSON: ```{json.dumps(arts, ensure_ascii=False)}```
     """).strip()
+
 
 def build_digest(prompt: str) -> str:
     resp = client.chat.completions.create(
@@ -143,6 +154,7 @@ def _sanitize(html_txt: str) -> str:
     html_txt = re.sub(r'href="([^"]+)"', lambda m: f'href="{m.group(1).replace("&", "&amp;")}"', html_txt)
     parts = re.split(r'(<[^>]+>)', html_txt)
     return ''.join(p if p.startswith('<') else _html.escape(p) for p in parts)
+
 
 def send_telegram(html: str):
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
