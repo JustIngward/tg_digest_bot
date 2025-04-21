@@ -7,10 +7,6 @@ load_dotenv()                      # подхватываем .env
 TZ = datetime.timezone(datetime.timedelta(hours=3))   # Moscow
 MODEL = "o3"                       # o3 или gpt‑4o‑mini
 
-#def make_prompt() -> str:
- #   today = datetime.datetime.now(TZ).strftime("%d %b %Y")
-  #  return (f"Сделай IT‑дайджест за {today}: 5 новостей за 48 ч, "
-   #         "обзор мирового IT‑рынка, российского рынка и 1С; добавь ссылки после каждой новости.")
 def make_prompt() -> str:
     """
     Возвращает промпт‑шаблон для модели.
@@ -61,8 +57,11 @@ def fetch_digest() -> str:
     return resp.output_text.strip()
 
 def send_to_telegram(text: str):
-    url = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
-    for chunk in textwrap.wrap(text, 4096):   # Telegram лимит 4096 символов
+    url      = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
+    char_max = 4000                # немного меньше лимита 4096
+
+    for i in range(0, len(text), char_max):
+        chunk = text[i:i+char_max]   # срез сохраняет все \n
         requests.post(url, json={
             "chat_id": os.getenv("CHAT_ID"),
             "text": chunk,
