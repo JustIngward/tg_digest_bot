@@ -89,26 +89,40 @@ def collect_once():
 
 # ───── VALIDATOR ─────
 
-def validate(raw:str,dedup:set):
+def validate(raw:str, dedup:set):
+    """Парсит черновик, применяет фильтры.
+    • Если модель не поставила 🌍/🇷🇺/🟡 — считаем строку глобальной (0).
+    • Убираем UTM, дедуп по MD5.
+    • HEAD‑проверку смягчили: 4xx/5xx лишь понижают score на 1.
+    • Порог полезности снижен до 2.
+    """
     buckets={0:[],1:[],2:[]}
     for ln in raw.splitlines():
-        sm=SECTION_RE.match(ln); sect=SECT_ORDER.get(sm.group(1)) if sm else None
+        sm=SECTION_RE.match(ln)
+        sect=SECT_ORDER.get(sm.group(1)) if sm else 0  # default Global
         m=NEWS_RE.search(ln)
-        if sect is None or not m:continue
+        if not m:
+            continue
         url,day,mon,year=m.group(1),int(m.group(2)),int(m.group(3)),m.group(4)
         year=int(year) if year else None
         url=strip_utm(url)
         h=md5u(url)
-        if h in dedup:continue
-        if not (allowed_domain(url) and fresh(day,mon,year) and head_ok(url)):continue
+        if h in dedup:
+            continue
+        if not fresh(day,mon,year):
+            continue
+        head_good=head_ok(url)
         score=relevance_score(ln)
-        if score<3:continue
+        if not head_good:
+            score=max(0,score-1)   # плохой HEAD снижает вес, но не убивает
+        if score<2:
+            continue
         buckets[sect].append((score, ln.replace(m.group(1), url)))
         dedup.add(h)
     out=[]
     for s in range(3):
-        out.extend([ln for _,ln in sorted(buckets[s],key=lambda t:t[0],reverse=True)])
-        out.append('')
+        out.extend([ln for _,ln in sorted(buckets[s], key=lambda t:t[0], reverse=True)])
+        out.append('')  # blank line
     return out
 
 # ───── MAIN PIPELINE ─────
