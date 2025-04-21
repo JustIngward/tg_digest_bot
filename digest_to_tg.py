@@ -3,7 +3,6 @@ import os, textwrap, datetime, openai, requests
 
 MODEL = "o3"              # << сюда можно вписать gpt-4o-mini или o3
 TZ = datetime.timezone(datetime.timedelta(hours=3))   # Moscow
-
 def get_headlines(query: str, hours: int = 96, n: int = 7) -> list[dict]:
     """Возвращает n свежих статей по теме за последние hours часов"""
     url = "https://newsapi.org/v2/everything"
@@ -18,7 +17,6 @@ def get_headlines(query: str, hours: int = 96, n: int = 7) -> list[dict]:
     data = requests.get(url, params=params, timeout=10).json()
     return [{"title": a["title"], "url": a["url"], "published": a["publishedAt"]}
             for a in data["articles"]]
-
 tools = [{
     "type": "function",
     "function": {
@@ -35,8 +33,6 @@ tools = [{
         }
     }
 }]
-
-
 def prompt(period: str) -> str:
     today = datetime.datetime.now(TZ).strftime("%d %b %Y")
     #if period == "weekly":
@@ -46,7 +42,6 @@ def prompt(period: str) -> str:
     #if period == "monthly":
         #return (f"Сделай месячный IT‑дайджест ({today}): 10 трендов, ссылки, эффект для бизнеса.")
     return (f"Сделай IT‑дайджест за {today}: 5 новостей за 48 ч, 2‑3 строки каждая, со ссылками. Дайджест должен содержать обзор мирового IT-рынка, Российского IT рынка и новостей 1С")
-
 def build(period: str) -> str:
     openai.api_key = os.getenv("OPENAI_API_KEY")
     resp = openai.chat.completions.create(
@@ -58,7 +53,6 @@ def build(period: str) -> str:
         max_completion_tokens=2048,  #было max_tokens
     )
     return resp.choices[0].message.content.strip()
-
 while resp.choices[0].finish_reason == "tool_call":
         call = resp.choices[0].message.tool_calls[0]
         args = eval(call.function.arguments)           # json.loads в проде!
@@ -76,10 +70,7 @@ while resp.choices[0].finish_reason == "tool_call":
             max_completion_tokens = 2048,
             temperature = 1,
         )
-
     return resp.choices[0].message.content.strip()
-
-
 def send(text: str):
     url = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
     for chunk in textwrap.wrap(text, 4096):
@@ -88,6 +79,5 @@ def send(text: str):
             "text": chunk,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False})
-
 if __name__ == "__main__":
     send(build(os.getenv("PERIOD", "daily")))
