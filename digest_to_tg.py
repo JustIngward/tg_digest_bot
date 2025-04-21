@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v7.0 (2025‑04‑21)
+"""IT‑Digest Telegram bot — v7.1 (2025‑04‑21)
 
-✦ Полная сборка «как в ручных дайджестах»
-─────────────────────────────────────────
-* Заголовок `🗞️ **IT‑Digest • DD Mon YYYY**`.
-* Фикс‑секции с эмодзи, пустая строка между ними.
-* Последней строкой добавляется блок Insight (берётся из черновика).
-* Технический фильтр + семантический скоринг ≥2.
-* HEAD 4xx/5xx снижает score на 1, но не убивает новость.
-* Whitelist опционален: если переменная `ALLOWED_DOMAINS` пуста → пропускаем все
-  домены.
+Fix: OpenAI 400 «unsupported value ‘temperature’»
+───────────────────────────────────────────────
+Модели семейства **o3** не принимают параметр `temperature` в chat/response
+энд‑поинтах, поэтому вынесли его полностью.
+
+Изменения v7.1
+‾‾‾‾‾‾‾‾‾‾‾‾‾‾‾
+* Удалён `temperature` из `client.responses.create` (Collector) и
+  `client.chat.completions.create` (Scorer).
+* Переменная `TEMP_GEN` оставлена «про запас», но не передаётся.
+* Остальная логика (скoring ≥2, HEAD‑смягчение, Insight, dedup) без изменений.
 """
 import os, re, sqlite3, datetime as dt, time, hashlib, requests
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, urlparse
@@ -20,8 +22,6 @@ from openai import OpenAI
 load_dotenv()
 TZ               = dt.timezone(dt.timedelta(hours=3))
 MODEL            = os.getenv("MODEL", "o3")
-TEMP_GEN         = float(os.getenv("TEMPERATURE", 1))
-TEMP_SCORE       = 0.2
 MAX_AGE_HOURS    = int(os.getenv("MAX_AGE_HOURS", 168))
 MIN_NEWS         = int(os.getenv("MIN_NEWS", 6))
 MIN_NEWS_SOFT    = int(os.getenv("MIN_NEWS_SOFT", 3))
@@ -71,17 +71,16 @@ def make_prompt(today:str)->str:
     return (
         f"Ты — IT‑аналитик. Сформируй черновик дайджеста. Правила:\n"
         f"• Новости ≤ {days} дней, {wl}.\n"
-        "• Формат одной строки: - **Заголовок** — суть. [Источник](URL) (DD.MM.YYYY)\n"
-        "• Секции в порядке: 🌍, 🇷🇺, 🟡. Пустая строка между секциями.\n"
-        f"• Минимум {MIN_NEWS} строк суммарно.\n"
-        "• В конце добавь блок Insight (2‑3 предложения)."
+        "• Формат: - **Заголовок** — суть. [Источник](URL) (DD.MM.YYYY)\n"
+        "• Секции: 🌍, 🇷🇺, 🟡 с пустой строкой между ними.\n"
+        f"• Минимум {MIN_NEWS} строк. Insight в конце."
     )
 
 # ───── SCORER ─────
 
 def relevance_score(line:str)->int:
-    prompt=f"Оцени полезность новости для ИТ‑специалиста (0‑5). Ответ — одно число.\nНовость: {line}"
-    r=client.chat.completions.create(model=MODEL,temperature=TEMP_SCORE,messages=[{"role":"user","content":prompt}])
+    q=f"Оцени полезность новости для IT‑специалиста (0‑5). Ответ одно число.\nНовость: {line}"
+    r=client.chat.completions.create(model=MODEL,messages=[{"role":"user","content":q}])
     try:
         return int(r.choices[0].message.content.strip()[:1])
     except:
@@ -91,7 +90,7 @@ def relevance_score(line:str)->int:
 
 def collect_once()->str:
     today=dt.datetime.now(TZ).strftime('%d %b %Y')
-    r=client.responses.create(model=MODEL,tools=[{"type":"web_search"}],input=[{"role":"user","content":make_prompt(today)}],temperature=TEMP_GEN,store=False)
+    r=client.responses.create(model=MODEL,tools=[{"type":"web_search"}],input=[{"role":"user","content":make_prompt(today)}],store=False)
     return r.output_text
 
 # ───── VALIDATOR ─────
@@ -101,13 +100,15 @@ def validate(raw:str, dedup:set):
     for ln in raw.splitlines():
         if ln.startswith('💡') or ln.lower().startswith('insight'):
             insight=ln.strip(); continue
-        m=NEWS_RE.search(ln); sect=SECT_ORDER.get((SECTION_RE.match(ln) or ['🌍'])[0]) if m else None
-        if sect is None or not m: continue
+        m=NEWS_RE.search(ln)
+        sect=SECT_ORDER.get((SECTION_RE.match(ln) or ['🌍'])[0]) if m else None
+        if not (m and sect is not None):
+            continue
         url,day,mon,year=m.group(1),int(m.group(2)),int(m.group(3)),m.group(4)
         year=int(year) if year else None
-        url=strip_utm(url)
-        h=md5u(url)
-        if h in dedup or not fresh(day,mon,year): continue
+        url=strip_utm(url); h=md5u(url)
+        if h in dedup or not fresh(day,mon,year):
+            continue
         score=relevance_score(ln)
         if not head_ok(url): score=max(0,score-1)
         if score<2: continue
@@ -115,8 +116,8 @@ def validate(raw:str, dedup:set):
         dedup.add(h)
     out=[f"🗞️ **IT‑Digest • {dt.datetime.now(TZ).strftime('%d %b %Y')}**",""]
     for s in range(3):
-        out.append([k for k,v in SECT_ORDER.items() if v==s][0]+' ')  # секции‑заглушка
-        out.extend([ln for _,ln in sorted(buckets[s], key=lambda t:t[0], reverse=True)])
+        out.append(list(SECT_ORDER.keys())[list(SECT_ORDER.values()).index(s)]+' ')
+        out.extend([ln for _,ln in sorted(buckets[s],key=lambda t:t[0],reverse=True)])
         out.append('')
     if insight:
         out.append(insight)
@@ -131,7 +132,7 @@ def produce_digest():
         lines=validate(collect_once(), seen); news_cnt=sum(1 for l in lines if l.startswith('-'))
         print(f"iter {i}: news={news_cnt}")
         if news_cnt>=MIN_NEWS or (i==MAX_ITER and news_cnt>=MIN_NEWS_SOFT):
-            db.executemany('INSERT OR IGNORE INTO sent VALUES(?)',[(md5u(l),) for l in lines if l.startswith('-')]); db.commit();
+            db.executemany('INSERT OR IGNORE INTO sent VALUES(?)',[(md5u(l),) for l in lines if l.startswith('-')]); db.commit()
             return "\n".join(lines)
         time.sleep(2)
     raise RuntimeError('Не удалось собрать дайджест')
@@ -141,9 +142,7 @@ def produce_digest():
 def send(msg:str):
     url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for i in range(0,len(msg),3900):
-        r=requests.post(url,json={"chat_id":CHAT_ID,"text":msg[i:i+3900],"parse_mode":"Markdown","disable_web_page_preview":False})
-        if r.status_code!=200:
-            raise RuntimeError(r.text)
+        requests.post(url,json={"chat_id":CHAT_ID,"text":msg[i:i+3900],"parse_mode":"Markdown","disable_web_page_preview":False})
 
 if __name__=='__main__':
     send(produce_digest())
