@@ -17,7 +17,7 @@ from openai import OpenAI
 # ───── CONFIG ─────
 load_dotenv()
 TZ            = dt.timezone(dt.timedelta(hours=3))
-MODEL         = os.getenv("MODEL", "o3")
+MODEL         = os.getenv("MODEL", "gpt-4o")
 TEMP          = float(os.getenv("TEMPERATURE", 0.8))
 MAX_AGE_DAYS  = int(os.getenv("MAX_AGE_DAYS", 7))
 MIN_LINES     = int(os.getenv("MIN_LINES", 6))
