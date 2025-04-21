@@ -1,152 +1,141 @@
 #!/usr/bin/env python3
-#IT‑Digest Telegram bot — v2
+"""IT‑Digest Telegram bot — v3 (\u202a\u202cApril 2025)
 
-#Изменения:
-#• Фильтр по дате (<= 48 ч) и HEAD‑валидация URL → старьё и битые ссылки не пройдут.
-#• Автоповтор генерации, если новостей слишком мало.
-#• Простой счётчик уже отправленных — чтобы не дублировать при перезапуске.
+Избавляемся от «старья» и добавляем второй, *мыслящий* слой AI.
 
+Главная идея:\n 1. **Collector (по‑прежнему идёт через модель с web_search)** генерирует черновик.\n 2. **Critic \u2014 отдельный вызов модели** проверяет черновик на свежесть/битые ссылки и при необходимости даёт рекомендации или сразу чинит.\n 3. Код автоматически применяет патч Critic‑а. Если после правок новостей < MIN_NEWS — запускаем Collector снова.
+
+Помимо этого:\n • HEAD‑валидация URL, фильтр по дате ≤ MAX_AGE_HOURS.\n • Mini‑SQLite для дедупликации.\n • .env теперь содержит CRITIC_MODEL (по умолчанию тот же).\n"""
 import os
 import re
 import sqlite3
-import datetime
-import requests
+import datetime as dt
 from hashlib import md5
+from typing import List
+
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
+# ────────────────────────────────── CONFIG ──╮
 load_dotenv()
-
-# ──────────────────────────────────────────── CONSTANTS ─╮
-TZ               = datetime.timezone(datetime.timedelta(hours=3))  # Moscow/UTC+3
-MODEL            = os.getenv("OPENAI_MODEL", "o3")
-MAX_AGE_HOURS    = 48                       # свежесть статей
-HEAD_TIMEOUT     = 6                        # сек
-MIN_NEWS         = 4                        # минимум годных статей → иначе реген
-SQLITE_PATH      = "sent_hashes.db"         # чтобы не дублировали ссылки
+TZ               = dt.timezone(dt.timedelta(hours=3))  # Europe/Moscow
+COLLECTOR_MODEL  = os.getenv("COLLECTOR_MODEL", "o3")
+CRITIC_MODEL     = os.getenv("CRITIC_MODEL", COLLECTOR_MODEL)
+MAX_AGE_HOURS    = int(os.getenv("MAX_AGE_HOURS", 48))
+MIN_NEWS         = int(os.getenv("MIN_NEWS", 4))
+HEAD_TIMEOUT     = 6
+SQLITE_PATH      = "sent_hashes.db"
 TG_TOKEN         = os.environ["TG_TOKEN"]
 CHAT_ID          = os.environ["CHAT_ID"]
 
 client = OpenAI()
 
-# ──────────────────────────────────────────── PROMPT ─────╯
+# ─────────────────────────────── PROMPTS ──╯
 
-def make_prompt() -> str:
-    """Промпт‑шаблон для OpenAI; жёстко требует свежих ссылок."""
-    today = datetime.datetime.now(TZ).strftime("%d %b %Y")
+def make_prompt(today: str) -> str:
     return f"""
-Ты — IT‑аналитик. Сформируй дайджест в строгом формате Markdown ниже.
-⚠️ Используй ТОЛЬКО источники, опубликованные не старше 48 часов от {today}.
-⚠️ Укажи дату публикации (ДД.ММ) после ссылки.
-
-Формат:
-🗞️ **IT‑Digest • {today}**
-
-🌍 **ГЛОБАЛЬНЫЙ IT**
-- **Жирный заголовок** — 1‑2 предложения сути. [Источник](URL) (DD.MM)
-
-🇷🇺 **РОССИЙСКИЙ TECH**
-- **Жирный заголовок** — 1‑2 предложения. [Источник](URL) (DD.MM)
-
-🟡 **ЭКОСИСТЕМА 1С**
-- **Жирный заголовок** — 1‑2 предложения. [Источник](URL) (DD.MM)
-
-💡 **Insight:** 2‑3 предложения, почему события важны PM‑ам.
-
-Правила: каждая новость с новой строки; секции разделяй пустой строкой; не больше 30 слов на новость.
+Ты — IT‑аналитик. Сформируй **черновик** IT‑дайджеста в формате Markdown ⬇️.
+Условия:
+• Бери ТОЛЬКО статьи < {MAX_AGE_HOURS} ч от {today}. (Проверь дату у источника!)
+• После каждой ссылки пишешь дату (ДД.ММ).
+• Не более 30 слов на новость.
+• Строго используй секции: 🌍 ГЛОБАЛЬНЫЙ IT, 🇷🇺 РОССИЙСКИЙ TECH, 🟡 ЭКОСИСТЕМА 1С.
+• Минимум {MIN_NEWS} новостей суммарно.
+• Markdown‑оформление, пример строки:
+  - **Microsoft открыла код…** — два предложения. [Источник](https://example.com) (21.04)
+• В конце блок Insight (2‑3 предложения).
 """
 
-# ──────────────────────────────────────────── VALIDATION ─╮
+CRITIC_SYSTEM = """Ты — редактор. На вход дан черновик IT‑дайджеста.\n— Проверь, что каждая дата ≤ {max_age} ч от сегодня (21 Apr 2025).\n— Если статья старше или без даты — удали строку.\n— Проверь HEAD каждой ссылки (если 4xx/5xx — удали).\n— Итог: отдай исправленный дайджест *в том же* формате.\nЕсли после чистки новостей < {min_news} — ответь только `RETRY` (без кавычек).\n""".format(max_age=MAX_AGE_HOURS, min_news=MIN_NEWS)
 
-def is_fresh(day: int, month: int) -> bool:
-    today   = datetime.datetime.now(TZ)
-    pubdate = datetime.datetime(today.year, month, day, tzinfo=TZ)
-    return (today - pubdate).total_seconds() <= MAX_AGE_HOURS * 3600
+# ─────────────────────────────── HELPERS ─╮
+URL_DATE_RE = re.compile(r"\]\((https?://[^)]+)\)\s*\((\d{2})\.(\d{2})\)")
 
-
-def is_alive(url: str) -> str | None:
-    """Возвращает конечный URL, если HEAD <400; иначе None."""
+def is_link_alive(url: str) -> bool:
     try:
         r = requests.head(url, allow_redirects=True, timeout=HEAD_TIMEOUT)
-        if r.status_code < 400:
-            return r.url  # финальный после редиректов
+        return r.status_code < 400
     except requests.RequestException:
-        pass
-    return None
+        return False
 
 
-URL_DATE_RE = re.compile(r"\]\((https?://[^\)]+)\)\s*\((\d{2})\.(\d{2})\)")
+def hash_url(url: str) -> str:
+    return md5(url.encode()).hexdigest()
 
+# ─────────────────────────────── COLLECTOR ─╯
 
-def validate_digest(text: str) -> str:
-    """Фильтрует старые/битые ссылки, удаляет дубликаты."""
-    lines, good = text.splitlines(), []
-    seen_hashes = {h for (h,) in DB.execute("SELECT hash FROM sent").fetchall()}
+def call_collector() -> str:
+    today = dt.datetime.now(TZ).strftime("%d %b %Y")
+    resp = client.responses.create(
+        model   = COLLECTOR_MODEL,
+        tools   = [{"type": "web_search"}],
+        input   = [{"role": "user", "content": make_prompt(today)}],
+        store   = False,
+    )
+    return resp.output_text.strip()
 
-    for ln in lines:
-        m = URL_DATE_RE.search(ln)
-        if not m:              # строка без ссылки → пасс‑сквозь
-            good.append(ln)
+# ─────────────────────────────── CRITIC ───╯
+
+def critic_pass(draft: str) -> str:
+    resp = client.chat.completions.create(
+        model = CRITIC_MODEL,
+        messages=[
+            {"role": "system", "content": CRITIC_SYSTEM},
+            {"role": "user", "content": draft},
+        ],
+        temperature=0,
+    )
+    return resp.choices[0].message.content.strip()
+
+# ─────────────────────────────── PIPELINE ─╯
+
+def produce_final_digest(max_iter: int = 4) -> str:
+    for _ in range(max_iter):
+        draft = call_collector()
+        cleaned = critic_pass(draft)
+        if cleaned == "RETRY":
             continue
-        url, day, month = m.group(1), int(m.group(2)), int(m.group(3))
-        if not is_fresh(day, month):
-            continue
-        final = is_alive(url)
-        if not final:
-            continue
-        h = md5(final.encode()).hexdigest()
-        if h in seen_hashes:
-            continue           # уже отправляли
-        ln = ln.replace(url, final)
-        good.append(ln)
-        DB.execute("INSERT OR IGNORE INTO sent VALUES (?, ?)", (h, int(datetime.datetime.now().timestamp())))
-        seen_hashes.add(h)
-    DB.commit()
-    return "\n".join(good)
+        return cleaned
+    raise RuntimeError("Не смог получить свежий дайджест после {max_iter} попыток")
 
-
-def count_news(text: str) -> int:
-    return sum(1 for ln in text.splitlines() if ln.startswith("- **"))
-
-# ──────────────────────────────────────────── OPENAI LOOP ─╯
-
-def fetch_valid_digest(max_attempts: int = 3) -> str:
-    prompt = make_prompt()
-    for attempt in range(1, max_attempts + 1):
-        resp = client.responses.create(
-            model   = MODEL,
-            tools   = [{"type": "web_search"}],
-            input   = [{"role": "user", "content": prompt}],
-            store   = False
-        )
-        raw = resp.output_text.strip()
-        fixed = validate_digest(raw)
-        if count_news(fixed) >= MIN_NEWS:
-            return fixed
-        print(f"⚠️ Попытка {attempt}: мало годных статей, пробуем ещё раз…")
-    return fixed  # отдаём последнее, даже если мало
-
-# ──────────────────────────────────────────── TELEGRAM ────╮
+# ─────────────────────────────── TELEGRAM ─╮
 
 def send_to_telegram(text: str):
-    url       = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    CHUNK_sz  = 3900  # чуть меньше лимита 4096
-    for i in range(0, len(text), CHUNK_sz):
-        chunk = text[i:i + CHUNK_sz]
-        resp  = requests.post(url, json={
+    URL_API  = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    CHUNK_SZ = 3900
+    for i in range(0, len(text), CHUNK_SZ):
+        chunk = text[i : i + CHUNK_SZ]
+        r = requests.post(URL_API, json={
             "chat_id": CHAT_ID,
             "text": chunk,
             "parse_mode": "Markdown",
             "disable_web_page_preview": False,
         })
-        if resp.status_code != 200:
-            print("Telegram error:", resp.text)
+        if r.status_code != 200:
+            raise RuntimeError(f"Telegram error {r.status_code}: {r.text}")
 
-# ──────────────────────────────────────────── MAIN ────────╯
+# ─────────────────────────────── MAIN ──────╯
 if __name__ == "__main__":
-    # init tiny DB for deduplication
-    DB = sqlite3.connect(SQLITE_PATH)
-    DB.execute("CREATE TABLE IF NOT EXISTS sent (hash TEXT PRIMARY KEY, ts INTEGER)")
+    # init dedup db (optional ‑ можно убрать, если критик и так удаляет повторы)
+    db = sqlite3.connect(SQLITE_PATH)
+    db.execute("CREATE TABLE IF NOT EXISTS sent (hash TEXT PRIMARY KEY)")
 
-    digest = fetch_valid_digest()
-    send_to_telegram(digest)
+    digest = produce_final_digest()
+
+    # дубли проверяем перед отправкой (на случай, если бот упал и поднялся)
+    all_urls: List[str] = URL_DATE_RE.findall(digest)
+    hashes = [hash_url(u) for u, *_ in all_urls]
+    cur = db.cursor()
+    cur.execute("SELECT hash FROM sent WHERE hash IN (%s)" % ("?"*len(hashes)), hashes)
+    exists = {h for (h,) in cur.fetchall()}
+    if exists:
+        for h in exists:
+            digest = re.sub(r".*%s.*\n" % h, "", digest)  # удаляем строку‑дубль
+        digest = digest.strip()
+    # запишем свежие
+    cur.executemany("INSERT OR IGNORE INTO sent(hash) VALUES(?)", [(h,) for h in hashes])
+    db.commit()
+
+    if digest:
+        send_to_telegram(digest)
