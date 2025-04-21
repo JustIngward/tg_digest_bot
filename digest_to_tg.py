@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v17.1 (2025‑04‑24)
+"""IT‑Digest Telegram bot — v17.2 (2025‑04‑24)
 
-Фиксы после пустого дайджеста:
-• body‑filter больше НЕ отбрасывает 1С‑статьи, даже если в HTML нет ключа.
-• need_onec ≥ 1 (а не 3) — дайджест соберётся, даже если 1С‑контента мало.
-• fallback: если после всех фильтров < DIGEST_MIN строк → отправляем короткое сообщение «за неделю нет релевантных новостей» и выходим без ошибки.
+✓ body‑filter пропускает 1С‑статьи без INCLUDE‑слов.
+✓ need_onec ≥ 1 — дайджест соберётся даже при скудном 1С‑потоке.
+✓ fallback‑сообщение, если итоговый список < DIGEST_MIN.
 """
 from __future__ import annotations
 
@@ -92,9 +91,9 @@ async def body_filter(cand):
         pages = await asyncio.gather(*[fetch_html(a["url"], cl) for a in subset])
     out = []
     for art, html in zip(subset, pages):
-        is_onec = urlparse(art["url"]).netloc in ONEC_DOMAINS or any(k in art["t"] for k in ONEC_KEYS)
         if not html:
             continue
+        is_onec = urlparse(art["url"]).netloc in ONEC_DOMAINS or any(k in art["t"] for k in ONEC_KEYS)
         if is_onec or any(k in plain(html) for k in INCLUDE):
             out.append(art)
     return out
@@ -121,11 +120,11 @@ def layout(news_onec, news_other, events):
 # ─── PROMPT ───
 
 def build_prompt(news, evnts):
-    today = dt.datetime.now(TZ).strftime("%d %b %Y")
     return textwrap.dedent(f"""
-        Ты — редактор B2B‑дайджеста для интеграторов 1С. Используй ТОЛЬКО данные JSON, ничего не выдумывай.
-        Секции: 🌍/🇷🇺/🟡/🎪. Если секция пуста — вставь строку «без …».
-        Требования: 8‑12 новостей (≥40 % 1С) + до 3 событий. Формат строки: - <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)
+        Ты — редактор B2B‑дайджеста для интеграторов 1С. Используй ТОЛЬКО данные JSON.
+        Секции: 🌍/🇷🇺/🟡/🎪. Если секция пуста — «без …».
+        Требования: 8‑12 новостей (≥40 % 1С) + до 3 событий.
+        Формат: - <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)
         В конце "💡 <b>Insight</b>:" — 2 предложения.
         JSON_NEWS: ```{json.dumps(news, ensure_ascii=False)}```
         JSON_EVENTS: ```{json.dumps(evnts, ensure_ascii=False)}```
@@ -140,9 +139,11 @@ def sanitize(txt):
 
 
 def send(html):
-    if not html.strip():
-        return
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for i in range(0, len(html), 3800):
         chunk = sanitize(html[i:i + 3800])
-        requests.post(api, json={"
+        requests.post(api, json={
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web
