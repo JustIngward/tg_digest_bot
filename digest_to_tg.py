@@ -21,7 +21,7 @@ def fetch_digest() -> str:
         store = False                        # историю нам хранить не нужно
     )
     # у Responses API ответ в resp.output[0].content
-    return resp.output[0].content.strip()
+    return resp.output_text.strip()
 
 def send_to_telegram(text: str):
     url = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
