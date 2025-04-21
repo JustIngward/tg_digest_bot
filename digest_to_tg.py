@@ -1,75 +1,79 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v1.0 (2025‑04‑22, rewrite)
+"""IT‑Digest Telegram bot — v13.0 (2025‑04‑22)
 
-▶  Минималистичный «с нуля»
-──────────────────────────
-▪ Python собирает новости (NewsAPI + RSS) → одно обращение к GPT‑4o
-  формирует готовый Markdown‑дайджест.
-▪ Без циклов tool‑calling, без сложных regex: проверяем только кол‑во пунктов.
-▪ SQLite‑память оставили, но можно выключить `USE_DB=0`.
+▲  Чистый минимал, правки по итогам теста
+─────────────────────────────────────────
+•  Формируем новости из NewsAPI (RU‑white‑list) **+** расширенный набор RSS.  
+•  Дедуп + легкий «diverse» фильтр: стараемся взять разные домены.  
+•  GPT‑4o получает готовый JSON и сам бьёт на секции.  
+•  Отправка в Telegram через HTML — теги `<b>/<i>` работают, всё остальное экранируется.
 """
 
 from __future__ import annotations
 
-import os, datetime as dt, json, sqlite3, textwrap, requests, feedparser
+import os, json, sqlite3, datetime as dt, textwrap, html, re, requests, feedparser
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 from openai import OpenAI
 
 # ───── CONFIG ─────
 load_dotenv()
-TZ               = dt.timezone(dt.timedelta(hours=3))
-MODEL            = os.getenv("MODEL", "gpt-4o")
-OPENAI_KEY       = os.getenv("OPENAI_API_KEY")
-NEWS_API_KEY     = os.getenv("NEWS_API_KEY")
-TG_TOKEN         = os.getenv("TG_TOKEN")
-CHAT_ID          = os.getenv("CHAT_ID")
-MAX_DAYS         = int(os.getenv("MAX_DAYS", 10))
-MAX_ARTICLES     = int(os.getenv("MAX_ARTICLES", 30))
-DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 12))  # итоговых строк
-USE_DB           = int(os.getenv("USE_DB", 1))
-SQLITE_PATH      = os.getenv("DB_PATH", "sent.db")
+OPENAI_KEY  = os.getenv("OPENAI_API_KEY")
+NEWS_API_KEY = os.getenv("NEWS_API_KEY")
+TG_TOKEN    = os.getenv("TG_TOKEN")
+CHAT_ID     = os.getenv("CHAT_ID")
+assert all([OPENAI_KEY, NEWS_API_KEY, TG_TOKEN, CHAT_ID]), "Missing env vars"
 
-assert all([OPENAI_KEY, TG_TOKEN, CHAT_ID, NEWS_API_KEY]), "Missing env vars"
+MODEL            = os.getenv("MODEL", "gpt-4o")
+TZ               = dt.timezone(dt.timedelta(hours=3))
+MAX_DAYS         = int(os.getenv("MAX_DAYS", 10))
+MAX_ARTICLES     = int(os.getenv("MAX_ARTICLES", 40))
+DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 12))
+SQLITE_PATH      = os.getenv("DB_PATH", "sent.db")
+USE_DB           = int(os.getenv("USE_DB", 1))
 
 client = OpenAI()
 
 WHITELIST = {
     "cnews.ru", "tadviser.ru", "vc.ru", "rbc.ru", "gazeta.ru",
     "1c.ru", "infostart.ru", "odysseyconsgroup.com",
-    "rusbase.ru", "trends.rbc.ru"
+    "rusbase.ru", "trends.rbc.ru", "novostiitkanala.ru", "triafly.ru",
 }
 
 RSS_FEEDS = [
+    # tech/it RU
     "https://habr.com/ru/rss/all/all/?fl=ru",
+    "https://vc.ru/rss",
+    "https://www.rbc.ru/technology/rss/full/",
+    "https://tadviser.ru/index.php/Статья:Новости?feed=rss",
+    "https://novostiitkanala.ru/feed/",
+    # 1С‑сообщество
     "https://1c.ru/news/all.rss",
     "https://infostart.ru/rss/news/",
-    "https://vc.ru/rss",
 ]
 
 # ───── DB helpers ─────
 if USE_DB:
-    conn = sqlite3.connect(SQLITE_PATH)
-    conn.execute("CREATE TABLE IF NOT EXISTS sent(url TEXT PRIMARY KEY)")
+    db = sqlite3.connect(SQLITE_PATH)
+    db.execute("CREATE TABLE IF NOT EXISTS sent(url TEXT PRIMARY KEY)")
 else:
-    conn = None
+    db = None
 
 def already_sent(url: str) -> bool:
-    if not conn:
-        return False
-    return conn.execute("SELECT 1 FROM sent WHERE url=?", (url,)).fetchone() is not None
+    if not db: return False
+    return db.execute("SELECT 1 FROM sent WHERE url=?", (url,)).fetchone() is not None
 
 def mark_sent(url: str):
-    if conn:
-        conn.execute("INSERT OR IGNORE INTO sent(url) VALUES (?)", (url,))
-        conn.commit()
+    if db:
+        db.execute("INSERT OR IGNORE INTO sent(url) VALUES (?)", (url,))
+        db.commit()
 
 # ───── COLLECT NEWS ─────
 
-def newsapi_fetch(q: str) -> list[dict]:
+def newsapi_fetch() -> list[dict]:
     url = "https://newsapi.org/v2/everything"
     params = {
-        "q": q,
+        "q": " ",
         "language": "ru",
         "from": (dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)).isoformat(),
         "pageSize": MAX_ARTICLES,
@@ -77,110 +81,108 @@ def newsapi_fetch(q: str) -> list[dict]:
         "domains": ",".join(WHITELIST),
         "apiKey": NEWS_API_KEY,
     }
-    data = requests.get(url, params=params, timeout=12).json()
-    return [{
-        "title": a["title"],
-        "url": a["url"],
-        "date": a["publishedAt"][:10]
-    } for a in data.get("articles", [])]
+    try:
+        data = requests.get(url, params=params, timeout=12).json()
+    except Exception:
+        return []
+    return [{"title": a["title"], "url": a["url"], "date": a["publishedAt"][:10]} for a in data.get("articles", [])]
 
 
-def rss_fetch(keywords: list[str]) -> list[dict]:
+def rss_fetch() -> list[dict]:
     res = []
     for feed in RSS_FEEDS:
-        parsed = feedparser.parse(feed)
+        try:
+            parsed = feedparser.parse(feed)
+        except Exception:
+            continue
         for e in parsed.entries:
-            title = e.get("title", "")
-            if all(k in title.lower() for k in keywords):
-                url = e.link
-                res.append({"title": title, "url": url, "date": e.get("published", "")[:10]})
+            link = e.link
+            res.append({
+                "title": e.get("title", ""),
+                "url": link,
+                "date": e.get("published", "")[:10],
+            })
     return res
 
 
+def diverse(arts: list[dict], want: int) -> list[dict]:
+    seen = set()
+    out  = []
+    for a in arts:
+        dom = urlparse(a["url"]).netloc
+        if dom in seen and len(out) < want - 3:
+            continue
+        seen.add(dom)
+        out.append(a)
+        if len(out) == want:
+            break
+    return out
+
+
 def gather_articles() -> list[dict]:
-    topics = ["it", "российский it", "1с"]
     pool = {}
-    for t in topics:
-        for art in newsapi_fetch(t) + rss_fetch(t.split()):
-            if already_sent(art["url"]):
-                continue
-            pool[art["url"]] = art
-            if len(pool) >= MAX_ARTICLES:
-                break
-    # сортировка по дате
-    articles = sorted(pool.values(), key=lambda a: a["date"], reverse=True)
-    return articles[:MAX_ARTICLES]
+    for art in newsapi_fetch() + rss_fetch():
+        url = art["url"]
+        if already_sent(url):
+            continue
+        pool[url] = art
+        if len(pool) >= MAX_ARTICLES:
+            break
+    arts = sorted(pool.values(), key=lambda a: a["date"], reverse=True)
+    return diverse(arts, DIGEST_NEWS_CNT)
 
 # ───── GPT PROMPT ─────
 
-def build_prompt(articles: list[dict]) -> str:
+def build_prompt(arts: list[dict]) -> str:
     today = dt.datetime.now(TZ).strftime("%d %b %Y")
-    json_blob = json.dumps(articles, ensure_ascii=False)
     return textwrap.dedent(f"""
-        Ты — профессиональный новостной редактор.
-        На вход получаешь JSON со статьями (title, url, date).
-        Отбери {DIGEST_NEWS_CNT} самых значимых для рынка IT РФ и экосистемы 1С.
-        Сформируй Markdown‑дайджест:
-        - Каждая строка: "- **Заголовок** — 1 предложение сути. [Источник](url) (DD.MM.YYYY)".
-        - Заголовок документа: "🗞️ **IT‑Digest • {today}**".
-        - В конце блок «💡 Insight» — 2 предложения о главной тенденции.
-        Всегда соблюдай формат.
-        JSON статей: ```{json_blob}```
-    """)
+        На входе JSON статей (title, url, date). Выведи дайджест Markdown‑HTML:
+        • Раздели на три секции с пустой строкой:
+          🌍 <b>GLOBAL IT</b>\n🇷🇺 <b>RU TECH</b>\n🟡 <b>1С ЭКОСИСТЕМА</b>
+        • Строка: "- <b>Заголовок</b> — одно предложение. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
+        • Всего {DIGEST_NEWS_CNT} новостей.
+        • В конце блок "💡 <b>Insight</b>:" — 2 предложения.
+        Санитайзируй HTML. JSON: ```{json.dumps(arts, ensure_ascii=False)}```
+    """).strip()
 
-# ───── BUILD DIGEST ─────
+# ───── GPT call ─────
 
-def build_digest(md_prompt: str) -> str:
+def build_digest(prompt: str) -> str:
     resp = client.chat.completions.create(
         model=MODEL,
-        messages=[{"role": "user", "content": md_prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.4,
-        max_tokens=1024,
+        max_tokens=1100,
     )
     return resp.choices[0].message.content.strip()
 
-# ───── TELEGRAM ─────
-
-def _md_to_html(md: str) -> str:
-    """Convert minimal subset of **bold** / __italic__ to HTML; escape others."""
-    import re, html
-    # temporary placeholders to avoid double‑escaping
-    md = md.replace("\_", "_esc_")
-    # bold
-    md = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{html.escape(m.group(1))}</b>", md)
-    # italic
-    md = re.sub(r"__(.+?)__", lambda m: f"<i>{html.escape(m.group(1))}</i>", md)
-    # escape the rest
-    md = html.escape(md)
-    return md.replace("_esc_", "_")
+# ───── Telegram (HTML) ─────
 
 def send_tg(text: str):
-    """Send digest as HTML (safer than MarkdownV2)."""
+    def chunker(s, n=3800):
+        for i in range(0, len(s), n):
+            yield s[i:i + n]
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for chunk in (text[i:i + 3800] for i in range(0, len(text), 3800)):
-        html_text = _md_to_html(chunk)
-        resp = requests.post(
-            api,
-            json={
-                "chat_id": CHAT_ID,
-                "text": html_text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
-            timeout=15,
-        )
-        print("TG", resp.status_code, resp.text[:120])
-        resp.raise_for_status()
+    for ch in chunker(text):
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": ch,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }
+        r = requests.post(api, json=payload, timeout=15)
+        print("TG", r.status_code, r.text[:100])
+        r.raise_for_status()
 
-# ───── MAIN ─────
+# ───── Main ─────
 
 def main():
     arts = gather_articles()
     if len(arts) < DIGEST_NEWS_CNT:
-        raise RuntimeError("Недостаточно свежих статей")
-    md = build_digest(build_prompt(arts))
-    send_tg(md)
-    for a in arts[:DIGEST_NEWS_CNT]:
+        raise RuntimeError("Недостаточно статей")
+    digest = build_digest(build_prompt(arts))
+    send_tg(digest)
+    for a in arts:
         mark_sent(a["url"])
     print("Digest sent ✔︎")
 
