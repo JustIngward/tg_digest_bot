@@ -1,94 +1,157 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v8.0 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v9.0 (2025‑04‑22)
 
-✦ Пересборка «с нуля» — один вызов модели формирует готовый дайджест
-───────────────────────────────────────────────────────────────────
-* Используем только **один** chat‑completion с web_search: модель сразу отдаёт
-  финальный Markdown.  
-* Python‑скрипт делает минимум валидации (регекс + кол‑во строк) и шлёт в TG.  
-* Нет пост‑скоринга и HEAD‑проверок → меньше токенов, меньше падений.  
-* Температура задаётся переменной `TEMPERATURE` (по‑умолчанию 0.8) — подходит
-  для o3.
+▪ GPT‑4o + встроенный web_search (whitelist) — модель сразу генерирует готовый
+  Markdown‑дайджест с краткими выжимками и кликабельными ссылками.
+▪ SQLite‑«память» отсекает новости, уже отправленные ранее (дубликаты ≤ 30 дней).
+▪ Fallback‑лооп — до 3 попыток, если модель дала слишком мало уникальных ссылок.
 """
-import os, re, sqlite3, datetime as dt, time, requests
+
+from __future__ import annotations
+
+import os
+import re
+import sqlite3
+import time
+import datetime as dt
+import textwrap
+from urllib.parse import urlparse
+
+import requests
 from dotenv import load_dotenv
 from openai import OpenAI
 
 # ───── CONFIG ─────
 load_dotenv()
-TZ            = dt.timezone(dt.timedelta(hours=3))
-MODEL         = os.getenv("MODEL", "gpt-4o")
-TEMP          = float(os.getenv("TEMPERATURE", 0.8))
-MAX_AGE_DAYS  = int(os.getenv("MAX_AGE_DAYS", 7))
-MIN_LINES     = int(os.getenv("MIN_LINES", 6))
-MAX_ITER      = int(os.getenv("MAX_ITER", 4))
-TG_TOKEN      = os.environ["TG_TOKEN"]
-CHAT_ID       = os.environ["CHAT_ID"]
+TZ                = dt.timezone(dt.timedelta(hours=3))  # Europe/Moscow
+MODEL             = os.getenv("MODEL", "gpt-4o")
+TEMPERATURE       = float(os.getenv("TEMPERATURE", 0.7))
+MAX_AGE_DAYS      = int(os.getenv("MAX_AGE_DAYS", 7))
+MIN_NEWS_LINES    = int(os.getenv("MIN_NEWS_LINES", 6))
+MAX_RETRIES       = int(os.getenv("MAX_RETRIES", 3))
+SQLITE_PATH       = os.getenv("DB_PATH", "sent_news.db")
+TG_TOKEN          = os.environ["TG_TOKEN"]
+CHAT_ID           = os.environ["CHAT_ID"]
+
+# Домены‑white‑list
+WHITELIST = {
+    "cnews.ru", "tadviser.ru", "vc.ru", "rbc.ru", "gazeta.ru",
+    "1c.ru", "infostart.ru", "odysseyconsgroup.com",
+    "rusbase.ru", "trends.rbc.ru", "novostiitkanala.ru", "triafly.ru",
+}
 
 client = OpenAI()
 
-NEWS_RE = re.compile(r"^\s*[-*]\s*(?:\*\*)?.+?\]\(https?://[^)\s]+\)\s*\(\d{2}\.\d{2}\.(?:\d{4})?\)")
+# ───── DB helpers ─────
+SCHEMA = """CREATE TABLE IF NOT EXISTS sent (
+    fp  TEXT PRIMARY KEY,
+    ts  DATETIME DEFAULT CURRENT_TIMESTAMP
+);"""
+
+def db_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(SQLITE_PATH)
+    conn.execute(SCHEMA)
+    return conn
+
+def url_fp(url: str) -> str:
+    return str(hash(url))  # достаточно для дедупликации
+
+def already_sent(url: str) -> bool:
+    with db_conn() as c:
+        return c.execute("SELECT 1 FROM sent WHERE fp=?", (url_fp(url),)).fetchone() is not None
+
+def mark_sent(url: str):
+    with db_conn() as c:
+        c.execute("INSERT OR IGNORE INTO sent(fp) VALUES (?)", (url_fp(url),))
 
 # ───── PROMPT ─────
 
 def build_prompt() -> str:
-    today = dt.datetime.now(TZ).strftime('%d %b %Y')
-    days  = MAX_AGE_DAYS
-    return f"""
-Ты — IT‑аналитик.
-Сделай готовый дайджест (Markdown) для IT‑департамента.
-Правила:
-1. Бери ТОЛЬКО реальные статьи, опубликованные ≤ {days} дней.
-2. Формат одной новости: `- **Заголовок** — суть. [Источник](URL) (DD.MM.YYYY)`.
-3. Секции строго в порядке и с пустой строкой между:
-   🌍 **ГЛОБАЛЬНЫЙ IT**
+    today = dt.datetime.now(TZ).strftime("%d %b %Y")
+    rules = textwrap.dedent(f"""
+        Ты — русский IT‑аналитик. Составь дайджест: краткие выжимки + ссылки.
+        Условия:
+        • Бери только статьи с доменов whitelist и возрастом ≤ {MAX_AGE_DAYS} дней.
+        • Формат новости: "- **Заголовок** — 1–2 предложения. [Источник](URL) (DD.MM.YYYY)".
+        • Строго три секции в порядке и пустой строкой между:
+          🌍 **ГЛОБАЛЬНЫЙ IT**
+          🇷🇺 **РОССИЙСКИЙ TECH**
+          🟡 **ЭКОСИСТЕМА 1С**
+        • Минимум {MIN_NEWS_LINES} новостей суммарно.
+        • В конце добавь блок "💡 **Insight:**" — 2–3 предложения выводов.
+        • Заголовок всего: "🗞️ **IT‑Digest • {today}**".
+        • Пиши по‑русски, без UTM‑меток и эмодзи кроме заданных.
+    """)
+    return rules.strip()
 
-   🇷🇺 **РОССИЙСКИЙ TECH**
+# ───── GENERATE ─────
+NEWS_RE = re.compile(r"^\s*[-*]\s+\*\*.+?\*\*.+\[.*?](https?://[^)\s]+)\s*\(\d{2}\.\d{2}\.\d{4}?\)")
 
-   🟡 **ЭКОСИСТЕМА 1С**
-4. Минимум {MIN_LINES} строк суммарно.
-5. В конце добавь `💡 **Insight:**` — 2‑3 предложения, зачем это важно.
-6. Заголовок всего дайджеста: `🗞️ **IT‑Digest • {today}**`.
-7. Пиши по‑русски, без лишних эмодзи и UTM‑меток.
-"""
 
-# ───── COLLECTOR ─────
-
-def collect() -> str:
-    # responses.create поддерживает web_search без function schema
-    resp = client.responses.create(
+def generate_digest() -> str:
+    tools = [{"type": "web_search", "domains": list(WHITELIST), "top_k": 12}]
+    response = client.chat.completions.create(
         model=MODEL,
-        tools=[{"type": "web_search"}],
-        input=[{"role": "user", "content": build_prompt()}],
-        temperature=TEMP,
-        store=False,
+        messages=[{"role": "user", "content": build_prompt()}],
+        tools=tools,
+        tool_choice="auto",
+        temperature=TEMPERATURE,
+        max_completion_tokens=900,
     )
-    return resp.output_text.strip()
+    return response.choices[0].message.content.strip()
 
-# ───── VALIDATE ─────
+# ───── VALIDATE & DEDUPE ─────
 
-def validate(md:str) -> bool:
-    lines=[l for l in md.splitlines() if NEWS_RE.match(l)]
-    return len(lines)>=MIN_LINES
+def extract_urls(md: str) -> list[str]:
+    urls = []
+    for line in md.splitlines():
+        m = NEWS_RE.match(line)
+        if m:
+            url = m.group(1)
+            urls.append(url)
+    return urls
 
-# ───── MAIN ─────
 
-def run():
-    for i in range(1,MAX_ITER+1):
-        draft = collect()
-        if validate(draft):
-            return draft
-        print(f"iter {i}: not enough lines, retry…")
-        time.sleep(2)
-    raise RuntimeError("Не удалось сформировать дайджест — модель не собрала достаточное число новостей")
+def validate_digest(md: str) -> bool:
+    lines = [l for l in md.splitlines() if NEWS_RE.match(l)]
+    if len(lines) < MIN_NEWS_LINES:
+        return False
+    # все ссылки whitelist + не отправлялись ранее
+    for url in extract_urls(md):
+        host = urlparse(url).netloc
+        if not any(host.endswith(d) for d in WHITELIST):
+            return False
+        if already_sent(url):
+            return False
+    return True
 
-# ───── SEND ─────
+# ───── SEND TO TELEGRAM ─────
 
-def send(msg:str):
-    url=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for i in range(0,len(msg),3900):
-        requests.post(url,json={"chat_id":CHAT_ID,"text":msg[i:i+3900],"parse_mode":"Markdown","disable_web_page_preview":False})
+def send_telegram(text: str):
+    api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for chunk in (text[i:i+3900] for i in range(0, len(text), 3900)):
+        requests.post(api, json={
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": False,
+        }, timeout=15).raise_for_status()
 
-if __name__=='__main__':
-    digest = run()
-    send(digest)
+# ───── MAIN LOOP ─────
+
+def main():
+    for attempt in range(1, MAX_RETRIES + 1):
+        digest = generate_digest()
+        if validate_digest(digest):
+            # сохраняем ссылки в БД, чтобы не повторять в будущем
+            for url in extract_urls(digest):
+                mark_sent(url)
+            send_telegram(digest)
+            print("Digest sent ✔︎")
+            return
+        print(f"Attempt {attempt}: validation failed, retrying…")
+        time.sleep(3)
+    raise RuntimeError("Не удалось сгенерировать валидный дайджест за отведённые попытки")
+
+if __name__ == "__main__":
+    main()
