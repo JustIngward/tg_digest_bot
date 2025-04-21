@@ -20,7 +20,7 @@ def build(period: str) -> str:
         model=MODEL,
         messages=[{"role":"user", "content": prompt(period)}],
         temperature=0.4,
-        max_tokens=10000,  #было 2048
+        max_tokens=4096,  #было 2048
     )
     return resp.choices[0].message.content.strip()
 
