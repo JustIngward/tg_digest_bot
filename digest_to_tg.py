@@ -84,7 +84,7 @@ def critic_pass(draft: str) -> str:
             {"role": "system", "content": CRITIC_SYSTEM},
             {"role": "user", "content": draft},
         ],
-        temperature=0,
+        temperature=1,
     )
     return resp.choices[0].message.content.strip()
 
