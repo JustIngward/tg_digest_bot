@@ -1,16 +1,8 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v14.0 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v14.1 (2025‑04‑22)
 
-📰  Полностью RSS‑‑only (без NewsAPI)
-───────────────────────────────────
-•  Источник новостей — только RSS‑ленты (расширенный список).  
-•  Больше нет переменной `NEWS_API_KEY`, никакой внешней API‑квоты.  
-•  Приоритет 1С: новости из доменов/ключей 1С выводятся первыми.  
-•  Если RSS совсем не даёт 1С‑пунктов — секция «1С» может быть пустой, но дайджест всё равно отправится.  
-•  Дедуп по URL по‑умолчанию **выключен** (`USE_DB=0`).  
-•  Отправка ‑ HTML, работа с GPT‑4o неизменна.
+📡  RSS‑only, приоритет 1С, без дубликатов кода‑ошибок
 """
-
 from __future__ import annotations
 
 import os, json, datetime as dt, textwrap, requests, feedparser
@@ -27,30 +19,27 @@ assert TG_TOKEN and CHAT_ID and OPENAI_KEY, "TG_TOKEN, CHAT_ID, OPENAI_API_KEY r
 
 MODEL            = os.getenv("MODEL", "gpt-4o")
 TZ               = dt.timezone(dt.timedelta(hours=3))
-MAX_DAYS         = int(os.getenv("MAX_DAYS", 7))        # берем неделю
+MAX_DAYS         = int(os.getenv("MAX_DAYS", 7))        # за сколько дней берём RSS
 DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 8))
 
 client = OpenAI()
 
-# домены и ключевые слова для приоритета 1С
+# ───── Ключевые слова / домены ─────
 ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
-ONEC_KEYS    = {
+ONEC_KEYS = {
     "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "erp", "wms",
     "зуп", "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия",
     "odin es", "одинэс"
 }
 
-# ключевые слова, чтобы отсеять офтоп (финансы, lifestyle и пр.)
 TECH_KEYWORDS = [
     "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
     "erp", "crm", "wms", "1с", "1c", "автоматиза", "интеграц", "миграц",
     "обновлен", "devops", "разработ", "api", "микросервис", "kubernetes"
-] = [
-    "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
-    "erp", "crm", "1с", "1c", "автоматиза",
 ]
 
-RSS_FEEDS = [ = [
+# ───── RSS‑ленты ─────
+RSS_FEEDS = [
     # Tech / IT Russia
     "https://habr.com/ru/rss/all/all/?fl=ru",
     "https://vc.ru/rss",
@@ -66,25 +55,26 @@ RSS_FEEDS = [ = [
     "https://rusbase.com/feed/",
 ]
 
-# ───── COLLECT RSS ─────
+# ───── Парсинг RSS ─────
 
 def _relevant(title: str) -> bool:
     t = title.lower()
     return any(k in t for k in TECH_KEYWORDS)
 
+
 def rss_fetch() -> list[dict]:
     cutoff = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
-    arts = []
+    arts: list[dict] = []
     for url in RSS_FEEDS:
         try:
             feed = feedparser.parse(url)
         except Exception:
             continue
         for e in feed.entries:
-            link  = getattr(e, "link", "")
+            link = getattr(e, "link", "")
             title = getattr(e, "title", "")
             if not _relevant(title):
-                continue  # фильтруем офтоп
+                continue
             date_str = getattr(e, "published", "")[:10]
             try:
                 date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
@@ -93,36 +83,32 @@ def rss_fetch() -> list[dict]:
             if date_obj < cutoff:
                 continue
             arts.append({"title": title, "url": link, "date": date_str})
-    return sorted(arts, key=lambda a: a["date"], reverse=True)(articles, key=lambda a: a["date"], reverse=True)
+    return sorted(arts, key=lambda a: a["date"], reverse=True)
 
-# ───── PRIORITIZE 1C ─────
+# ───── Приоритет 1С ─────
 
-def is_onec(a: dict) -> bool:
-    t = a["title"].lower()
-    if any(k in t for k in ONEC_KEYS):
-        return True
-    if urlparse(a["url"]).netloc in ONEC_DOMAINS:
-        return True
-    return False
+def is_onec(art: dict) -> bool:
+    t = art["title"].lower()
+    return any(k in t for k in ONEC_KEYS) or urlparse(art["url"]).netloc in ONEC_DOMAINS
 
 
 def select_articles(all_articles: list[dict]) -> list[dict]:
     onec = [a for a in all_articles if is_onec(a)]
     other = [a for a in all_articles if not is_onec(a)]
-    # требуем хотя бы 2 новости 1С, если есть
+    # минимум 2 новости 1С если есть
     selected = (onec[:2] if len(onec) >= 2 else onec) + other
-    return selected[:DIGEST_NEWS_CNT][:DIGEST_NEWS_CNT]
+    return selected[:DIGEST_NEWS_CNT]
 
-# ───── GPT PROMPT ─────
+# ───── GPT‑Prompt ─────
 
 def build_prompt(arts: list[dict]) -> str:
     today = dt.datetime.now(TZ).strftime("%d %b %Y")
     return textwrap.dedent(f"""
         На входе JSON статей (title, url, date). Составь дайджест HTML‑Markdown:
-        • Раздели на три секции с пустой строкой:
+        • Три секции с пустой строкой:
           🌍 <b>GLOBAL IT</b>\n🇷🇺 <b>RU TECH</b>\n🟡 <b>1С ЭКОСИСТЕМА</b>
-        • Формат строки: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
-        • Если статей меньше {DIGEST_NEWS_CNT} — выведи сколько есть.
+        • Формат: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
+        • Если статей меньше {DIGEST_NEWS_CNT} — выводи сколько есть.
         • В конце блок "💡 <b>Insight</b>:" — 2 предложения.
         JSON: ```{json.dumps(arts, ensure_ascii=False)}```
     """).strip()
@@ -138,7 +124,7 @@ def build_digest(prompt: str) -> str:
     )
     return r.choices[0].message.content.strip()
 
-# ───── TELEGRAM ─────
+# ───── Telegram ─────
 
 def send_telegram(html: str):
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -150,7 +136,7 @@ def send_telegram(html: str):
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         }, timeout=20)
-        print("TG", r.status_code, r.text[:80])
+        print("TG", r.status_code, r.text[:70])
         r.raise_for_status()
 
 # ───── MAIN ─────
