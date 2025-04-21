@@ -1,38 +1,37 @@
 #!/usr/bin/env python3
-import os, textwrap, datetime, openai, requests
+import os, textwrap, datetime, requests
+from openai import OpenAI          # новенький клиент
+from dotenv import load_dotenv
 
-MODEL = "o3"              # << сюда можно вписать gpt-4o-mini или o3
+load_dotenv()                      # подхватываем .env
 TZ = datetime.timezone(datetime.timedelta(hours=3))   # Moscow
+MODEL = "o3"                       # o3 или gpt‑4o‑mini
 
-def prompt(period: str) -> str:
+def make_prompt() -> str:
     today = datetime.datetime.now(TZ).strftime("%d %b %Y")
-    #if period == "weekly":
-        #start = (datetime.datetime.now(TZ) - datetime.timedelta(days=6)).strftime("%d %b")
-        #return (f"Сделай недельный IT‑дайджест ({start} – {today}): 7 новостей, "
-                #"ссылки, минимум один пункт о 1С.")
-    #if period == "monthly":
-        #return (f"Сделай месячный IT‑дайджест ({today}): 10 трендов, ссылки, эффект для бизнеса.")
-    return (f"Сделай IT‑дайджест за {today}: 5 новостей за 48 ч, 2‑3 строки каждая, со ссылками. Дайджест должен содержать обзор мирового IT-рынка, Российского IT рынка и новостей 1С")
+    return (f"Сделай IT‑дайджест за {today}: 5 новостей за 48 ч, "
+            "обзор мирового IT‑рынка, российского рынка и 1С; добавь ссылки после каждой новости.")
 
-def build(period: str) -> str:
-    openai.api_key = os.getenv("OPENAI_API_KEY")
-    resp = openai.chat.completions.create(
-        model=MODEL,
-        tools = [{"type": "web_search"}], # --- новая строка, по легенде должна дать доступ модели в интернет. 
-        messages=[{"role":"user", "content": prompt(period)}],
-        temperature=1, # было 0.4. Новая версия поддерживает только 1
-        max_completion_tokens=2048,  #было max_tokens
+def fetch_digest() -> str:
+    client = OpenAI()  # ключ читается из OPENAI_API_KEY
+    resp = client.responses.create(
+        model = MODEL,
+        tools = [{"type": "web_search"}],    # ← даёт модели интернет
+        input = [{"role": "user", "content": make_prompt()}],
+        store = False                        # историю нам хранить не нужно
     )
-    return resp.choices[0].message.content.strip()
+    # у Responses API ответ в resp.output[0].content
+    return resp.output[0].content.strip()
 
-def send(text: str):
+def send_to_telegram(text: str):
     url = f"https://api.telegram.org/bot{os.getenv('TG_TOKEN')}/sendMessage"
-    for chunk in textwrap.wrap(text, 4096):
+    for chunk in textwrap.wrap(text, 4096):   # Telegram лимит 4096 символов
         requests.post(url, json={
             "chat_id": os.getenv("CHAT_ID"),
             "text": chunk,
             "parse_mode": "Markdown",
-            "disable_web_page_preview": False})
+            "disable_web_page_preview": False
+        })
 
 if __name__ == "__main__":
-    send(build(os.getenv("PERIOD", "daily")))
+    send_to_telegram(fetch_digest())
