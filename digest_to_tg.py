@@ -31,11 +31,16 @@ ONEC_KEYS = {
     "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "wms", "зуп",
     "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия", "odin es", "одинэс"
 }
-TECH_KEYWORDS = [
-    "it", "ai", "искусствен", "цифров", "облач", "кибер", "безопас",
-    "erp", "crm", "wms", "1с", "1c", "автоматиза", "интеграц", "миграц",
-    "обновлен", "devops", "разработ", "api", "микросервис", "kubernetes",
-] + list(ONEC_KEYS)
+TECH_INCLUDE = [
+    "1с", "1c", "erp", "crm", "wms", "зуп", "devops", "kubernetes", "облач",
+    "цифров", "интеграци", "миграци", "автоматиза", "искусствен", "ai",
+]
+TECH_EXCLUDE = [
+    "iphone", "crypto", "биткоин", "ethereum", "самолет", "авто", "электромобил",
+    "шоколад", "фисташк", "биржа", "lifestyle", "здоровье", "банкомат",
+]
+# include + extra keys
+TECH_KEYWORDS = TECH_INCLUDE + list(ONEC_KEYS) + list(ONEC_KEYS)
 
 # ───── RSS LIST ─────
 RSS_FEEDS = [
@@ -59,7 +64,9 @@ def _plain(html: str) -> str:
     return BeautifulSoup(html, "html.parser").get_text(" ").lower()
 
 def _hit(text: str) -> bool:
-    return any(k in text for k in TECH_KEYWORDS)
+    if any(w in text for w in TECH_EXCLUDE):
+        return False
+    return any(k in text for k in TECH_INCLUDE) or any(k in text for k in ONEC_KEYS)k in text for k in TECH_KEYWORDS)
 
 def rss_fetch() -> list[dict]:
     out = []
@@ -70,17 +77,18 @@ def rss_fetch() -> list[dict]:
             continue
         for e in feed.entries:
             link, title = e.get("link", ""), e.get("title", "")
-            date_str = e.get("published", "")[:10]
+            date_str = (e.get("published") or e.get("updated") or e.get("dc_date") or "")[:10]
             try:
                 date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
             except Exception:
-                date_obj = CUTOFF
+                date_obj = dt.datetime.utcnow()  # дата не распарсилась – считаем свежей
+            title_lower = title.lower()
             if date_obj >= CUTOFF:
-                out.append({"title": title, "url": link, "date": date_str})
+                out.append({"title": title, "url": link, "date": date_obj.strftime("%d.%m.%Y"), "_t": title_lower})({"title": title, "url": link, "date": date_str})
     return sorted(out, key=lambda a: a["date"], reverse=True)
 
 def filter_stage(arts: list[dict]) -> list[dict]:
-    first = [a for a in arts if _hit(a["title"].lower())]
+    first = [a for a in arts if _hit(a["_t"])]
     if len(first) >= DIGEST_NEWS_CNT:
         return first[:DIGEST_NEWS_CNT]
     for a in arts:
