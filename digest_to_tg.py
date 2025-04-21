@@ -158,9 +158,36 @@ def build_digest(prompt: str) -> str:
 
 # ───── Telegram ─────
 
+import html as _html, re as _re
+
+def _sanitize(html_txt: str) -> str:
+    """Экранируем & внутри href и < > внутри текста, оставляя теги <b>, <i>, <a>."""
+    # 1) & в ссылках → &amp;
+    def _amp(m):
+        url = m.group(1).replace("&", "&amp;")
+        return f'href="{url}"'
+    html_txt = _re.sub(r'href="([^"]+)"', _amp, html_txt)
+    # 2) Экранируем < и > вне тегов
+    safe = []
+    for part in _re.split(r'(<[^>]+>)', html_txt):
+        if part.startswith('<'):
+            safe.append(part)
+        else:
+            safe.append(_html.escape(part))
+    return ''.join(safe)
+
 def send_telegram(html: str):
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for i in range(0, len(html), 3800):
+        chunk = _sanitize(html[i:i+3800])
+        r = requests.post(api, json={
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": False,
+        }, timeout=20)
+        print("TG", r.status_code, r.text[:90])
+        r.raise_for_status()(0, len(html), 3800):
         chunk = html[i:i+3800]
         r = requests.post(api, json={
             "chat_id": CHAT_ID,
