@@ -55,13 +55,15 @@ def build_prompt() -> str:
 # ───── COLLECTOR ─────
 
 def collect() -> str:
-    resp = client.chat.completions.create(
+    # responses.create поддерживает web_search без function schema
+    resp = client.responses.create(
         model=MODEL,
-        tools=[{"type":"web_search"}],
-        messages=[{"role":"user","content":build_prompt()}],
+        tools=[{"type": "web_search"}],
+        input=[{"role": "user", "content": build_prompt()}],
         temperature=TEMP,
+        store=False,
     )
-    return resp.choices[0].message.content.strip()
+    return resp.output_text.strip()
 
 # ───── VALIDATE ─────
 
