@@ -177,30 +177,22 @@ def _sanitize(html_txt: str) -> str:
     return ''.join(safe)
 
 def send_telegram(html: str):
+    """Отправляет HTML‑дайджест в Telegram, экранируя опасные символы."""
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
     for i in range(0, len(html), 3800):
-        chunk = _sanitize(html[i:i+3800])
-        r = requests.post(api, json={
+        chunk = _sanitize(html[i:i + 3800])
+        resp = requests.post(api, json={
             "chat_id": CHAT_ID,
             "text": chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": False,
         }, timeout=20)
-        print("TG", r.status_code, r.text[:90])
-        r.raise_for_status()(0, len(html), 3800):
-        chunk = html[i:i+3800]
-        r = requests.post(api, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }, timeout=20)
-        print("TG", r.status_code, r.text[:70])
-        r.raise_for_status()
+        print("TG", resp.status_code, resp.text[:90])
+        resp.raise_for_status()
 
 # ───── MAIN ─────
 
-def main():
+def main():():
     arts = select_articles(rss_fetch())
     digest = build_digest(build_prompt(arts))
     send_telegram(digest)
