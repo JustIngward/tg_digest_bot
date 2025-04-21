@@ -122,9 +122,9 @@ FUNCTIONS={"fetch_news":fetch_news}
 NEWS_RE=re.compile(r"^\s*[-*]\s+\*\*.+?\*\*.+\[(?P<text>.*?)\]\((?P<url>https?://[^)\s]+)\)\s*\(\d{2}\.\d{2}\.\d{4}?\)")
 
 def chat_digest():
-    msgs=[{"role":"user","content":build_prompt()}]
+    msgs = [{"role": "user", "content": build_prompt()}]
     while True:
-        resp=client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=MODEL,
             messages=msgs,
             tools=TOOLS,
@@ -132,16 +132,25 @@ def chat_digest():
             temperature=TEMPERATURE,
             max_completion_tokens=900,
         )
-        choice=resp.choices[0]
-        if choice.finish_reason=="tool_call":
-            call=choice.message.tool_calls[0]
-            name=call.function.name
-            args=json.loads(call.function.arguments)
-            result=FUNCTIONS[name](**args)
-            msgs.append(choice.message)
-            msgs.append({"role":"tool","tool_call_id":call.id,"name":name,"content":json.dumps(result,ensure_ascii=False)})
+        choice = resp.choices[0]
+        # 1️⃣  Если модель просит инструмент — исполняем и повторяем запрос
+        if choice.finish_reason == "tool_call":
+            call = choice.message.tool_calls[0]
+            args = json.loads(call.function.arguments)
+            result = FUNCTIONS[call.function.name](**args)
+            msgs += [
+                choice.message,  # tool‑call
+                {
+                    "role": "tool",
+                    "tool_call_id": call.id,
+                    "name": call.function.name,
+                    "content": json.dumps(result, ensure_ascii=False),
+                },
+            ]
             continue
-        return choice.message.content.strip()
+        # 2️⃣  Модель закончила — может вернуть пустой контент (None)
+        content = choice.message.content or ""
+        return content.strip()
 
 # ───── VALIDATE ─────
 
