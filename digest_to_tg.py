@@ -19,7 +19,7 @@ def build(period: str) -> str:
     resp = openai.chat.completions.create(
         model=MODEL,
         messages=[{"role":"user", "content": prompt(period)}],
-        temperature=0.4,
+        temperature=1, # было 0.4. Новая версия поддерживает только 1
         max_completion_tokens=2048,  #было max_tokens
     )
     return resp.choices[0].message.content.strip()
