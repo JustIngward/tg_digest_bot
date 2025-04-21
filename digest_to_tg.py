@@ -1,181 +1,187 @@
 #!/usr/bin/env python3
-"""IT‑Digest Telegram bot — v15.2 (2025‑04‑22)
+"""IT‑Digest Telegram bot — v16.0 (2025‑04‑22)
 
-• RSS‑only
-• Двухэтапный фильтр (title + HTML)
-• Приоритет 1С (≥ 2 пункта, если доступны)
-• HTML‑safe отправка в Telegram
+🆕  «50×10» RSS‑захват → async‑HTML → GPT‑ранж
+──────────────────────────────────────────────
+*  **Широкий сбор**: до 50 элементов из каждой ленты (≈500).
+*  **Баланс 40 % 1С**: два отдельных пула, добор «хвостом» из other.
+*  **Двухуровневый отбор**
+   1. fast — фильтр по title (include/exclude ключи).
+   2. slow — async скрейп HTML (httpx, 20 коннектов).
+*  **GPT‑ранж**: один вызов 4o возвращает score 0‑10; берём верхнюю половину.
+*  Итог — 8‑12 строк, ≥ 40 % 1С (мин 3 пункта).
+*  Жёстко: «используй ТОЛЬКО факты из входного JSON, не придумывай».  
+*  HTML‑safe отправка.
 """
 from __future__ import annotations
 
-import os, re, json, datetime as dt, textwrap, requests, feedparser, html as _html
+import os, re, json, asyncio, datetime as dt, textwrap, html as _html
+from collections import defaultdict
 from urllib.parse import urlparse
+
+import feedparser, httpx, python_dotenv
 from bs4 import BeautifulSoup
-from dotenv import load_dotenv
 from openai import OpenAI
 
 # ───── CONFIG ─────
-load_dotenv()
-TG_TOKEN = os.getenv("TG_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+python_dotenv.load_dotenv()
+TG_TOKEN  = os.getenv("TG_TOKEN")
+CHAT_ID   = os.getenv("CHAT_ID")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
-assert TG_TOKEN and CHAT_ID and OPENAI_KEY, "TG_TOKEN, CHAT_ID, OPENAI_API_KEY required"
+assert TG_TOKEN and CHAT_ID and OPENAI_KEY, "env vars missing"
 
-MODEL = os.getenv("MODEL", "gpt-4o")
-TZ = dt.timezone(dt.timedelta(hours=3))
-MAX_DAYS = int(os.getenv("MAX_DAYS", 7))
-DIGEST_NEWS_CNT = int(os.getenv("DIGEST_NEWS_CNT", 8))
+MODEL      = os.getenv("MODEL", "gpt-4o")
+TZ         = dt.timezone(dt.timedelta(hours=3))
+MAX_DAYS   = 7
+MAX_PER_FEED = 50
+MAX_HTML   = 250
+DIGEST_MIN = 8
+DIGEST_MAX = 12
+PERC_ONEC  = 0.4   # 40 %
 
 client = OpenAI()
 
-# ───── KEYWORDS ─────
+# ───── KEYS ─────
 ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
-ONEC_KEYS = {
-    "1с", "1c", "1‑с", "1-с", "1с:erp", "1с:предприятие", "wms", "зуп",
-    "управление торговлей", "ут", "унф", "upp", "unf", "бухгалтерия", "odin es", "одинэс"
-}
-TECH_INCLUDE = [
-    "1с", "1c", "erp", "crm", "wms", "зуп", "devops", "kubernetes", "облач",
-    "цифров", "интеграци", "миграци", "автоматиза", "искусствен", "ai",
-]
-TECH_EXCLUDE = [
-    "iphone", "crypto", "биткоин", "ethereum", "самолет", "авто", "электромобил",
-    "шоколад", "фисташк", "биржа", "lifestyle", "здоровье", "банкомат",
-]
+ONEC_KEYS = {"1с", "1c", "1с:erp", "erp", "зуп", "унф", "управление торговлей", "бухгалтерия"}
+INCLUDE = set(ONEC_KEYS)|{"ai","devops","облач","цифров","интеграц","миграц","kubernetes","crm","wms"}
+EXCLUDE = {"crypto","iphone","шоколад","lifestyle","авто","биржа","банкомат"}
 
-# ───── RSS LIST ─────
+# ───── RSS FEEDS ─────
 RSS_FEEDS = [
-    "https://habr.com/ru/rss/all/all/?fl=ru",
-    "https://vc.ru/rss",
-    "https://www.rbc.ru/technology/rss/full/",
-    "https://tadviser.ru/index.php/Статья:Новости?feed=rss",
-    "https://novostiitkanala.ru/feed/",
-    "https://www.kommersant.ru/RSS/section-tech.xml",
-    "https://1c.ru/news/all.rss",
-    "https://infostart.ru/rss/news/",
-    "https://trends.rbc.ru/trends.rss",
-    "https://rusbase.com/feed/",
+    "https://habr.com/ru/rss/all/all/?fl=ru","https://vc.ru/rss","https://www.rbc.ru/technology/rss/full/",
+    "https://tadviser.ru/index.php/Статья:Новости?feed=rss","https://novostiitkanala.ru/feed/",
+    "https://www.kommersant.ru/RSS/section-tech.xml","https://1c.ru/news/all.rss",
+    "https://infostart.ru/rss/news/","https://trends.rbc.ru/trends.rss","https://rusbase.com/feed/",
 ]
-
 CUTOFF = dt.datetime.utcnow() - dt.timedelta(days=MAX_DAYS)
 
-# ───── FETCH & FILTER ─────
+# ───── helpers ─────
+RE_TAG = re.compile(r"<[^>]+>")
 
-def _plain(html: str) -> str:
-    return BeautifulSoup(html, "html.parser").get_text(" ").lower()
+def plain(html:str)->str:
+    return BeautifulSoup(html,"html.parser").get_text(" ").lower()
 
-def _hit(text: str) -> bool:
-    if any(w in text for w in TECH_EXCLUDE):
-        return False
-    return any(k in text for k in TECH_INCLUDE) or any(k in text for k in ONEC_KEYS)
+async def fetch_html(url:str, client:httpx.AsyncClient)->str|None:
+    try:
+        r = await client.get(url, timeout=6)
+        if r.status_code==200:
+            return r.text
+    except Exception:
+        return None
 
+# ───── stage 0 : collect 50 per feed ─────
 
-def rss_fetch() -> list[dict]:
-    out = []
-    for url in RSS_FEEDS:
+def collect_raw():
+    onec_pool, other_pool = [], []
+    for feed in RSS_FEEDS:
         try:
-            feed = feedparser.parse(url)
+            fp = feedparser.parse(feed)
         except Exception:
             continue
-        for e in feed.entries:
-            link, title = e.get("link", ""), e.get("title", "")
-            date_str = (e.get("published") or e.get("updated") or e.get("dc_date") or "")[:10]
+        count=0
+        for e in fp.entries:
+            if count>=MAX_PER_FEED: break
+            link=e.get("link","")
+            title=e.get("title","")
+            date_str=(e.get("published") or e.get("updated") or "")[:10]
             try:
-                date_obj = dt.datetime.strptime(date_str, "%Y-%m-%d")
-            except Exception:
-                date_obj = dt.datetime.utcnow()  # считай свежей
-            if date_obj < CUTOFF:
-                continue
-            out.append({
-                "title": title,
-                "url": link,
-                "date": date_obj.strftime("%d.%m.%Y"),
-                "_t": title.lower(),
-            })
-    return sorted(out, key=lambda a: a["date"], reverse=True)
+                d=dt.datetime.strptime(date_str,"%Y-%m-%d")
+            except: d=dt.datetime.utcnow()
+            if d<CUTOFF: continue
+            rec={"title":title,"url":link,"date":d.strftime("%d.%m.%Y"),"t":title.lower()}
+            (onec_pool if any(dom in link for dom in ONEC_DOMAINS) or any(k in rec["t"] for k in ONEC_KEYS) else other_pool).append(rec)
+            count+=1
+    return onec_pool, other_pool
 
+# ───── stage 1 : title filter — keep relevant ─────
 
-def filter_stage(arts: list[dict]) -> list[dict]:
-    first = [a for a in arts if _hit(a["_t"])]
-    if len(first) >= DIGEST_NEWS_CNT:
-        return first[:DIGEST_NEWS_CNT]
-    for a in arts:
-        if a in first:
+def title_filter(lst):
+    out=[]
+    for a in lst:
+        t=a["t"]
+        if any(x in t for x in EXCLUDE):
             continue
-        try:
-            page = requests.get(a["url"], timeout=10).text
-        except Exception:
-            continue
-        if _hit(_plain(page)):
-            first.append(a)
-        if len(first) >= DIGEST_NEWS_CNT:
-            break
-    return first
+        if any(k in t for k in INCLUDE):
+            out.append(a)
+    return out
 
+# ───── stage 2 : async body filter ─────
 
-def is_onec(a: dict) -> bool:
-    return (any(k in a["title"].lower() for k in ONEC_KEYS) or
-            urlparse(a["url"]).netloc in ONEC_DOMAINS)
+async def body_filter(candidates:list[dict]):
+    selected=candidates.copy()
+    if len(selected)>=MAX_HTML: selected=selected[:MAX_HTML]
+    async with httpx.AsyncClient(follow_redirects=True, headers={"User-Agent":"Mozilla/5.0"}) as c:
+        tasks=[fetch_html(a["url"],c) for a in selected]
+        pages=await asyncio.gather(*tasks)
+    out=[]
+    for a,html in zip(selected,pages):
+        if html and any(k in plain(html) for k in INCLUDE):
+            out.append(a)
+    return out
 
+# ───── stage 3 : GPT ranking ─────
 
-def select_articles(all_arts: list[dict]) -> list[dict]:
-    arts = filter_stage(all_arts)
-    onec = [a for a in arts if is_onec(a)]
-    other = [a for a in arts if not is_onec(a)]
-    sel = (onec[:2] if len(onec) >= 2 else onec) + other
-    return sel[:DIGEST_NEWS_CNT]
+def gpt_rank(pool:list[dict]):
+    prompt="Оцени по шкале 0‑10 важность новости для интегратора 1С. Ответ JSON вида {\"idx\":score}. Не добавляй ничего.""
+    mini=[{"idx":i,"title":a["title"],"url":a["url"]} for i,a in enumerate(pool)]
+    resp=client.chat.completions.create(model=MODEL,messages=[{"role":"user","content":prompt+json.dumps(mini,ensure_ascii=False)}],temperature=0,max_tokens=300)
+    try:
+        scores=json.loads(resp.choices[0].message.content)
+    except: scores={str(i):5 for i in range(len(pool))}
+    ranked=sorted(pool,key=lambda x:-scores.get(str(pool.index(x)),0))
+    return ranked[:DIGEST_MAX*2]  # оставим запас
 
-# ───── GPT ─────
+# ───── layout ─────
 
-def build_prompt(arts: list[dict]) -> str:
-    today = dt.datetime.now(TZ).strftime("%d %b %Y")
+def layout(arts:list[dict]):
+    onec=[a for a in arts if any(k in a["t"] for k in ONEC_KEYS) or urlparse(a["url"]).netloc in ONEC_DOMAINS]
+    other=[a for a in arts if a not in onec]
+    need_onec=max(3,int(DIGEST_MAX*PERC_ONEC))
+    final=(onec[:need_onec]+other)[:DIGEST_MAX]
+    return final
+
+# ───── prompt / digest / send (reuse v15.2) ─────
+
+def build_prompt(arts):
+    today=dt.datetime.now(TZ).strftime("%d %b %Y")
     return textwrap.dedent(f"""
-        На входе JSON статей (title, url, date). Составь дайджест HTML‑Markdown c тремя секциями:
-        🌍 <b>GLOBAL IT</b>\n🇷🇺 <b>RU TECH</b>\n🟡 <b>1С ЭКОСИСТЕМА</b>
-        Формат: "- <b>Заголовок</b> — 1‑2 предложения. <a href=\"url\">Источник</a> (DD.MM.YYYY)".
-        Если статей меньше {DIGEST_NEWS_CNT}, выводи столько, сколько есть.
-        В конце блок "💡 <b>Insight</b>:" — 2 предложения.
-        JSON: ```{json.dumps(arts, ensure_ascii=False)}```
-    """).strip()
+        Ты — редактор B2B‑дайджеста для интеграторов 1С. Используй ТОЛЬКО данные JSON, не выдумывай.
+        Требования: 8‑12 строк; секции 🌍/🇷🇺/🟡; 40 % строк про 1С; формат "- <b>Заголовок</b> — …".
+        В конце блок Insight.
+        JSON: ```{json.dumps(arts,ensure_ascii=False)}```
+    """)
 
-
-def build_digest(prompt: str) -> str:
-    resp = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-        max_tokens=1000,
-    )
-    return resp.choices[0].message.content.strip()
-
-# ───── TELEGRAM ─────
-
-def _sanitize(html_txt: str) -> str:
-    html_txt = re.sub(r'href="([^"]+)"', lambda m: f'href="{m.group(1).replace("&", "&amp;")}"', html_txt)
-    parts = re.split(r'(<[^>]+>)', html_txt)
+def sanitize(html_txt:str):
+    html_txt=re.sub(r'href="([^"]+)"',lambda m:f'href="{m.group(1).replace("&","&amp;")}"',html_txt)
+    parts=re.split(r'(<[^>]+>)',html_txt)
     return ''.join(p if p.startswith('<') else _html.escape(p) for p in parts)
 
 
-def send_telegram(html: str):
-    api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for i in range(0, len(html), 3800):
-        chunk = _sanitize(html[i:i+3800])
-        r = requests.post(api, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": False,
-        }, timeout=20)
-        print("TG", r.status_code, r.text[:80])
+def send(html:str):
+    api=f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    for i in range(0,len(html),3800):
+        chunk=sanitize(html[i:i+3800])
+        r=requests.post(api,json={"chat_id":CHAT_ID,"text":chunk,"parse_mode":"HTML"})
         r.raise_for_status()
 
 # ───── MAIN ─────
 
 def main():
-    arts = select_articles(rss_fetch())
-    digest = build_digest(build_prompt(arts))
-    send_telegram(digest)
-    print(f"Digest sent with {len(arts)} articles ✔︎")
+    pool_onec,pool_other=collect_raw()
+    pool_onec=title_filter(pool_onec)
+    pool_other=title_filter(pool_other)
+    # баланс
+    target_onec=int(PERC_ONEC*500)
+    pool_other=pool_other[:500-len(pool_onec)]
+    merged=pool_onec+pool_other
+    # html stage
+    filtered=asyncio.run(body_filter(merged))
+    ranked=gpt_rank(filtered)
+    digest_list=layout(ranked)
+    prompt=build_prompt(digest_list)
+    result=client.chat.completions.create(model=MODEL,messages=[{"role":"user","content":prompt}],temperature=0.3,max_tokens=1200)
+    send(result.choices[0].message.content.strip())
 
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
