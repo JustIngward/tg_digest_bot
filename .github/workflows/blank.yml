@@ -2,7 +2,7 @@ name: Telegram Digest   # ← заголовок, который появитс�
 
 on:
   schedule:
-    - cron:  '0 5 * * *'      # daily 08:00 MSK
+    #- cron:  '0 5 * * *'      # daily 08:00 MSK
   workflow_dispatch:          # ручной запуск из UI
 
 jobs:
