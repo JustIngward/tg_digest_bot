@@ -141,15 +141,35 @@ def build_digest(md_prompt: str) -> str:
 
 # ───── TELEGRAM ─────
 
+def _md_to_html(md: str) -> str:
+    """Convert minimal subset of **bold** / __italic__ to HTML; escape others."""
+    import re, html
+    # temporary placeholders to avoid double‑escaping
+    md = md.replace("\_", "_esc_")
+    # bold
+    md = re.sub(r"\*\*(.+?)\*\*", lambda m: f"<b>{html.escape(m.group(1))}</b>", md)
+    # italic
+    md = re.sub(r"__(.+?)__", lambda m: f"<i>{html.escape(m.group(1))}</i>", md)
+    # escape the rest
+    md = html.escape(md)
+    return md.replace("_esc_", "_")
+
 def send_tg(text: str):
+    """Send digest as HTML (safer than MarkdownV2)."""
     api = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    for chunk in (text[i:i+3800] for i in range(0, len(text), 3800)):
-        resp = requests.post(api, json={
-            "chat_id": CHAT_ID,
-            "text": chunk,
-            "parse_mode": "MarkdownV2",
-            "disable_web_page_preview": False,
-        }, timeout=15)
+    for chunk in (text[i:i + 3800] for i in range(0, len(text), 3800)):
+        html_text = _md_to_html(chunk)
+        resp = requests.post(
+            api,
+            json={
+                "chat_id": CHAT_ID,
+                "text": html_text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=15,
+        )
+        print("TG", resp.status_code, resp.text[:120])
         resp.raise_for_status()
 
 # ───── MAIN ─────
