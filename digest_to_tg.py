@@ -7,12 +7,13 @@ from __future__ import annotations
 import asyncio, datetime as dt, html as _html, json, os, re, textwrap
 from urllib.parse import urlparse
 
-import feedparser, httpx, python_dotenv, requests
+import feedparser, httpx, requests
+from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 from openai import OpenAI
 
 # ───── ENV / CONFIG ─────
-python_dotenv.load_dotenv()
+load_dotenv()
 TG_TOKEN   = os.getenv("TG_TOKEN")
 CHAT_ID    = os.getenv("CHAT_ID")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
