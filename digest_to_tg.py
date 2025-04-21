@@ -26,11 +26,11 @@ assert all([OPENAI_KEY, NEWS_API_KEY, TG_TOKEN, CHAT_ID]), "Missing env vars"
 
 MODEL            = os.getenv("MODEL", "gpt-4o")
 TZ               = dt.timezone(dt.timedelta(hours=3))
-MAX_DAYS         = int(os.getenv("MAX_DAYS", 10))
+MAX_DAYS         = int(os.getenv("MAX_DAYS", 7))  # берем 7 дней)  # берем 20 дней)
 MAX_ARTICLES     = int(os.getenv("MAX_ARTICLES", 40))
-DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 12))
+DIGEST_NEWS_CNT  = int(os.getenv("DIGEST_NEWS_CNT", 8))  # по умолчанию 8)
 SQLITE_PATH      = os.getenv("DB_PATH", "sent.db")
-USE_DB           = int(os.getenv("USE_DB", 1))
+USE_DB           = int(os.getenv("USE_DB", 0))  # по‑умолчанию без дедупа)
 
 client = OpenAI()
 
@@ -40,16 +40,24 @@ WHITELIST = {
     "rusbase.ru", "trends.rbc.ru", "novostiitkanala.ru", "triafly.ru",
 }
 
+# домены и ключевые слова, указывающие на «1С»‑тематику
+ONEC_DOMAINS = {"1c.ru", "infostart.ru", "odysseyconsgroup.com"}
+ONEC_KEYS = {"1с", "1c", "1‑с", "1-с"}
+
 RSS_FEEDS = [
-    # tech/it RU
+    # Tech / IT Russia
     "https://habr.com/ru/rss/all/all/?fl=ru",
     "https://vc.ru/rss",
     "https://www.rbc.ru/technology/rss/full/",
     "https://tadviser.ru/index.php/Статья:Новости?feed=rss",
     "https://novostiitkanala.ru/feed/",
-    # 1С‑сообщество
+    "https://www.kommersant.ru/RSS/section-tech.xml",
+    # Экосистема 1С
     "https://1c.ru/news/all.rss",
     "https://infostart.ru/rss/news/",
+    # Бизнес / аналитика
+    "https://trends.rbc.ru/trends.rss",
+    "https://rusbase.com/feed/",
 ]
 
 # ───── DB helpers ─────
@@ -119,7 +127,16 @@ def diverse(arts: list[dict], want: int) -> list[dict]:
     return out
 
 
+def _is_onec(art: dict) -> bool:
+    title_low = art["title"].lower()
+    if any(k in title_low for k in ONEC_KEYS):
+        return True
+    if urlparse(art["url"]).netloc in ONEC_DOMAINS:
+        return True
+    return False
+
 def gather_articles() -> list[dict]:
+    # собираем общий пул
     pool = {}
     for art in newsapi_fetch() + rss_fetch():
         url = art["url"]
@@ -128,8 +145,17 @@ def gather_articles() -> list[dict]:
         pool[url] = art
         if len(pool) >= MAX_ARTICLES:
             break
+
     arts = sorted(pool.values(), key=lambda a: a["date"], reverse=True)
-    return diverse(arts, DIGEST_NEWS_CNT)
+
+    # 1️⃣  выделяем 1C‑новости
+    onec_news   = [a for a in arts if _is_onec(a)]
+    other_news  = [a for a in arts if not _is_onec(a)]
+
+    # 2️⃣  ограничиваем, чтобы дайджест был не длиннее
+    selected = onec_news + other_news
+    selected = diverse(selected, DIGEST_NEWS_CNT)  # сохраняем разнообразие доменов
+    return selected[:DIGEST_NEWS_CNT]
 
 # ───── GPT PROMPT ─────
 
@@ -179,7 +205,7 @@ def send_tg(text: str):
 def main():
     arts = gather_articles()
     if len(arts) < DIGEST_NEWS_CNT:
-        raise RuntimeError("Недостаточно статей")
+        print(f"WARNING: only {len(arts)} articles, sending anyway")
     digest = build_digest(build_prompt(arts))
     send_tg(digest)
     for a in arts:
